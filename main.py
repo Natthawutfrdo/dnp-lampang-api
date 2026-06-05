@@ -108,14 +108,18 @@ async def process_shapefile(
             ngarn = int(rem // 400)
             wa = round((rem % 400) / 4)
 
-        # 💡 จุดสำคัญแก้บั๊กไฟล์ 21 MB: ลดทอนจุดพิกัดที่ซับซ้อนเกินจำเป็น (Simplify)
-        # ช่วยย่อยขนาดตัวอักษร GeoJSON ลงกว่า 80% ก่อนส่งเข้าฐานข้อมูล เพื่อความรวดเร็วและปลอดภัย
-       # 1. เพิ่มค่า tolerance เป็น 0.0001 (ช่วยลดจุดพิกัดที่ละเอียดเกินจำเป็นออกไปได้มหาศาล)
-        gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
-        
-        # 2. ป้องกันกรณีที่ตารางพิกัดมีขนาดใหญ่เกินไป โดยการตรวจสอบขนาด String ของ GeoJSON
-        geojson_data = json.loads(gdf.to_json())
-        geojson_string = json.dumps(geojson_data)
+      gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+
+        # --- อัปโหลดไฟล์ Shapefile (.zip) ขึ้น Supabase Storage (เวอร์ชันแก้บั๊กชื่อไฟล์มีเว้นวรรค) ---
+        safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
+        with open(zip_path, "rb") as f_data:
+            supabase.storage.from_("dnp-shapefiles").upload(
+                path=clean_filename,
+                file=f_data,
+                file_options={"cache-control": "3600", "upsert": "true"}
+            )
+        shapefile_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_filename)
         
         # หากพบว่าขนาดตัวอักษร GeoJSON ยังใหญ่เกิน 5MB ให้ทำการดึงเฉพาะกล่องขอบเขต (Bounding Box) 
         # หรือสั่งย่อพิกัดเพิ่มอีกชั้น เพื่อป้องกันฐานข้อมูลพัง (Statement Timeout)
