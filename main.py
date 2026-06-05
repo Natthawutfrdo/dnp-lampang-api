@@ -110,9 +110,19 @@ async def process_shapefile(
 
         # 💡 จุดสำคัญแก้บั๊กไฟล์ 21 MB: ลดทอนจุดพิกัดที่ซับซ้อนเกินจำเป็น (Simplify)
         # ช่วยย่อยขนาดตัวอักษร GeoJSON ลงกว่า 80% ก่อนส่งเข้าฐานข้อมูล เพื่อความรวดเร็วและปลอดภัย
-        gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.00001, preserve_topology=True)
+       # 1. เพิ่มค่า tolerance เป็น 0.0001 (ช่วยลดจุดพิกัดที่ละเอียดเกินจำเป็นออกไปได้มหาศาล)
+        gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+        
+        # 2. ป้องกันกรณีที่ตารางพิกัดมีขนาดใหญ่เกินไป โดยการตรวจสอบขนาด String ของ GeoJSON
         geojson_data = json.loads(gdf.to_json())
-
+        geojson_string = json.dumps(geojson_data)
+        
+        # หากพบว่าขนาดตัวอักษร GeoJSON ยังใหญ่เกิน 5MB ให้ทำการดึงเฉพาะกล่องขอบเขต (Bounding Box) 
+        # หรือสั่งย่อพิกัดเพิ่มอีกชั้น เพื่อป้องกันฐานข้อมูลพัง (Statement Timeout)
+        if len(geojson_string.encode('utf-8')) > 5 * 1024 * 1024:
+            # เพิ่มความเข้มข้นในการย่อยพิกัดหากไฟล์ยังคงใหญ่เกินไป
+            gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0005, preserve_topology=True)
+            geojson_data = json.loads(gdf.to_json())
         # --- อัปโหลดไฟล์ Shapefile (.zip) ขึ้น Supabase Storage ---
         clean_filename = f"{case_no.replace('/', '_')}_{file.filename}"
         with open(zip_path, "rb") as f_data:
