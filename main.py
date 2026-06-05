@@ -108,7 +108,8 @@ async def process_shapefile(
             ngarn = int(rem // 400)
             wa = round((rem % 400) / 4)
 
-      gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+     # 💡 [เริ่มวางแทนที่ตรงนี้] -> สั่งลดทอนจุดพิกัดลงเล็กน้อยเพื่อให้ไฟล์เบาลง
+        gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
 
         # --- อัปโหลดไฟล์ Shapefile (.zip) ขึ้น Supabase Storage (เวอร์ชันแก้บั๊กชื่อไฟล์มีเว้นวรรค) ---
         safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
@@ -120,7 +121,74 @@ async def process_shapefile(
                 file_options={"cache-control": "3600", "upsert": "true"}
             )
         shapefile_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_filename)
+
+        # --- อัปโหลดไฟล์เอกสารสแกน (.pdf) ขึ้น Supabase Storage ---
+        pdf_public_url = ""
+        if pdf_file:
+            safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
+            pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
+            with open(pdf_temp_path, "wb") as pdf_buffer:
+                shutil.copyfileobj(pdf_file.file, pdf_buffer)
+            
+            with open(pdf_temp_path, "rb") as pdf_data:
+                supabase.storage.from_("dnp-pdfs").upload(
+                    path=pdf_filename,
+                    file=pdf_data,
+                    file_options={"cache-control": "3600", "upsert": "true"}
+                )
+            pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
+
+        # --- ⚡ วิธีแก้คอขวดเด็ดขาด: แปลง GeoJSON เป็นไฟล์สลักลงตู้จัดเก็บแทนการยัดลงตาราง ---
+        geojson_data = json.loads(gdf.to_json())
+        geojson_string = json.dumps(geojson_data, ensure_ascii=False)
         
+        geojson_filename = f"{case_no.replace('/', '_')}_map.json"
+        geojson_temp_path = os.path.join(temp_dir, geojson_filename)
+        
+        with open(geojson_temp_path, "w", encoding="utf-8") as json_file:
+            json_file.write(geojson_string)
+            
+        with open(geojson_temp_path, "rb") as json_data:
+            supabase.storage.from_("dnp-shapefiles").upload(
+                path=geojson_filename,
+                file=json_data,
+                file_options={"cache-control": "3600", "upsert": "true"}
+            )
+        geojson_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(geojson_filename)
+
+        # --- บันทึกข้อมูลคดีลงตาราง (ฟิลด์ geojson_data จะเก็บเป็นตัวหนังสือลิงก์ URL แทน) ---
+        is_finished_bool = True if status == 'คดีสิ้นสุด' else False
+        
+        if case_type == 'encroachment':
+            db_data = {
+                "case_no": case_no, "case_date": case_date, "location": location,
+                "rai": rai, "ngarn": ngarn, "wa": wa, "is_finished": is_finished_bool,
+                "case_status": case_status, "coords": calculated_coords, "agency": agency,
+                "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                "pdf_url": pdf_public_url, 
+                "geojson_data": geojson_public_url
+            }
+            supabase.table("encroachment_cases").insert(db_data).execute()
+        else:
+            db_data = {
+                "case_no": case_no, "case_date": case_date, "location": location,
+                "timber_type": timber_type, "width": width, "length": length, "size": size,
+                "vol_logs": vol1, "vol_processed": vol2, "is_finished": is_finished_bool,
+                "case_status": case_status, "coords": calculated_coords, "agency": agency,
+                "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                "pdf_url": pdf_public_url, 
+                "geojson_data": geojson_public_url
+            }
+            supabase.table("timber_cases").insert(db_data).execute()
+
+        return {
+            "success": True,
+            "message": "ประมวลผลสำเร็จและจัดเก็บพิกัดแผนที่แบบความเร็วสูงเสร็จสิ้น",
+            "coords": calculated_coords,
+            "geojson_url": geojson_public_url
+        }
+        # 💡 [จบโซนวางแทนที่]
         # หากพบว่าขนาดตัวอักษร GeoJSON ยังใหญ่เกิน 5MB ให้ทำการดึงเฉพาะกล่องขอบเขต (Bounding Box) 
         # หรือสั่งย่อพิกัดเพิ่มอีกชั้น เพื่อป้องกันฐานข้อมูลพัง (Statement Timeout)
         if len(geojson_string.encode('utf-8')) > 5 * 1024 * 1024:
