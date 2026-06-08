@@ -24,23 +24,28 @@ app.add_middleware(
 )
 
 # --- 💡 ตั้งค่าเชื่อมต่อ Supabase พร้อมเพิ่มเวลา Timeout สำหรับไฟล์ใหญ่ ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("https://pihngogrcxxeqyvulnwl.supabase.co", "")
+SUPABASE_KEY = os.environ.get("sb_publishable_VcEhhWluqdphyd9jnZBY1g_qaJiFn39", "")
 
+# แก้ไขจุดนี้: เปลี่ยนจากการ raise Error ตัดไฟแอป เป็นการพิมพ์แจ้งเตือนใน Log แทน ป้องกันระบบล่มตอนสตาร์ท
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeWarning("กรุณาตั้งค่า SUPABASE_URL และ SUPABASE_KEY ใน Environment Variables")
+    print("⚠️ [WARNING] ไม่พบค่า SUPABASE_URL หรือ SUPABASE_KEY ใน Environment Variables กรุณาตรวจสอบในแดชบอร์ด Render")
 
 # กำหนดเวลาให้ระบบยอมรอการอ่าน/เขียนข้อมูลสูงสุด 300 วินาที (5 นาที) สำหรับไฟล์ขนาดใหญ่
 custom_timeout = HttpxTimeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
 
-supabase: Client = create_client(
-    SUPABASE_URL, 
-    SUPABASE_KEY,
-    options=ClientOptions(
-        postgrest_client_timeout=custom_timeout,
-        storage_client_timeout=custom_timeout
+# ตรวจสอบความพร้อมก่อนสร้าง Client เพื่อความปลอดภัย
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(
+        SUPABASE_URL, 
+        SUPABASE_KEY,
+        options=ClientOptions(
+            postgrest_client_timeout=custom_timeout,
+            storage_client_timeout=custom_timeout
+        )
     )
-)
+else:
+    supabase = None
 
 def extract_gis_and_calculate(zip_path: str, extract_dir: str):
     """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา"""
@@ -95,7 +100,7 @@ def read_root():
 
 @app.post("/analyze-shapefile/")
 async def analyze_shapefile(file: UploadFile = File(...)):
-    """[เพิ่มใหม่] เส้น API สำหรับดึงค่าพิกัดและคำนวณพื้นที่แสดงพรีวิวบนหน้าจอก่อนกดบันทึกจริง"""
+    """เส้น API สำหรับดึงค่าพิกัดและคำนวณพื้นที่แสดงพรีวิวบนหน้าจอก่อนกดบันทึกจริง"""
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์บีบอัดประเภท .zip")
         
@@ -108,7 +113,6 @@ async def analyze_shapefile(file: UploadFile = File(...)):
             extract_dir = os.path.join(temp_dir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
             
-            # เรียกฟังก์ชันแงะข้อมูล
             gis_result = extract_gis_and_calculate(zip_path, extract_dir)
             
             return {
@@ -134,11 +138,9 @@ async def process_shapefile(
     case_status: str = Form(...),
     agency: str = Form(...),
     suspects_count: int = Form(0),
-    # ฟิลด์เฉพาะคดีบุกรุก
     rai: float = Form(0.0),
     ngarn: float = Form(0.0),
     wa: float = Form(0.0),
-    # ฟิลด์เฉพาะคดีไม้
     timber_type: str = Form(""),
     width: float = Form(0.0),
     length: float = Form(0.0),
@@ -146,7 +148,10 @@ async def process_shapefile(
     vol1: float = Form(0.0),
     vol2: float = Form(0.0)
 ):
-    """เส้น API หลักสำหรับบันทึกข้อมูลลงฐานข้อมูลและเก็บไฟล์แผนที่ขนาดยักษ์ (คงโครงสร้างเดิมที่ดีอยู่แล้วไว้ทั้งหมด)"""
+    """เส้น API หลักสำหรับบันทึกข้อมูลลงฐานข้อมูลและเก็บไฟล์แผนที่ขนาดยักษ์เข้าถังเก็บไฟล์"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="ระบบฐานข้อมูล Supabase ยังไม่ได้เชื่อมต่ออย่างถูกต้อง")
+        
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             zip_path = os.path.join(temp_dir, file.filename)
@@ -156,12 +161,10 @@ async def process_shapefile(
             extract_dir = os.path.join(temp_dir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
             
-            # ดึงข้อมูล GIS และพิกัดภูมิศาสตร์
             gis_result = extract_gis_and_calculate(zip_path, extract_dir)
             gdf_wgs84 = gis_result["gdf_wgs84"]
             calculated_coords = gis_result["coords"]
             
-            # ลดทอนจุดที่ละเอียดเกินไปเพื่อรักษาประสิทธิภาพความเร็วหน้าเว็บ
             gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
 
             # --- 1. อัปโหลดไฟล์ Shapefile (.zip) ขึ้น Supabase Storage ---
@@ -245,9 +248,9 @@ async def process_shapefile(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# แนะนำให้เปิดใช้งานช่องดึงข้อมูลและการลบตามตารางเดิมของคุณเพื่อความสมบูรณ์
 @app.get("/get-cases/{case_type}")
 async def get_cases(case_type: str):
+    if not supabase: raise HTTPException(status_code=500, detail="Supabase not connected")
     try:
         table_name = "encroachment_cases" if case_type == "encroachment" else "timber_cases"
         res = supabase.table(table_name).select("*").execute()
@@ -257,6 +260,7 @@ async def get_cases(case_type: str):
 
 @app.delete("/delete-case/{case_type}/{case_no}")
 async def delete_case(case_type: str, case_no: str):
+    if not supabase: raise HTTPException(status_code=500, detail="Supabase not connected")
     try:
         table_name = "encroachment_cases" if case_type == "encroachment" else "timber_cases"
         supabase.table(table_name).delete().eq("case_no", case_no).execute()
