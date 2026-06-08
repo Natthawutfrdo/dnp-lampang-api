@@ -10,7 +10,6 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import mapping
 from supabase import create_client, Client, ClientOptions
-from httpx import Timeout as HttpxTimeout
 
 app = FastAPI(title="DNP GIS Case API Systems")
 
@@ -28,27 +27,25 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ [WARNING] 不พบค่า SUPABASE_URL หรือ SUPABASE_KEY ในระบบ")
+    print("⚠️ [WARNING] ไม่พบค่า SUPABASE_URL หรือ SUPABASE_KEY ในระบบ")
     print("กรุณาตรวจสอบการกรอกค่าเหล่านี้ในหน้าแดชบอร์ดเมนู Environment บน Render.com เพื่อให้ระบบบันทึกคดีได้")
 
-# กำหนดเวลาให้ระบบยอมรอการอ่าน/เขียนข้อมูลสูงสุด 300 วินาที (5 นาที) สำหรับแปลงพิกัดขนาดใหญ่
-custom_timeout = HttpxTimeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
-
-# ทำการเชื่อมต่อ Supabase อย่างปลอดภัย
+# 🛠️ [จุดแก้ไขสำคัญ]: ตัดการสร้างออบเจกต์ custom_timeout ของ httpx ออก 
+# เพื่อป้องกันบั๊กลึกของระบบเครือข่าย 'bad operand type for abs(): Timeout'
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase: Optional[Client] = create_client(
-        SUPABASE_URL, 
-        SUPABASE_KEY,
-        options=ClientOptions(
-            postgrest_client_timeout=custom_timeout,
-            storage_client_timeout=custom_timeout
+    try:
+        supabase: Optional[Client] = create_client(
+            SUPABASE_URL, 
+            SUPABASE_KEY
         )
-    )
+    except Exception as init_err:
+        print(f"❌ ไม่สามารถเริ่มต้น Supabase Client ได้: {str(init_err)}")
+        supabase = None
 else:
     supabase = None
 
 def extract_gis_and_calculate(zip_path: str, extract_dir: str):
-    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา [แก้ไขดักจับ Timeout ป้องกันบั๊ก abs()]"""
+    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา"""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
@@ -66,7 +63,6 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
             
         shp_path = os.path.join(extract_dir, shp_files[0])
         
-        # อ่านไฟล์อย่างปลอดภัย ป้องกันปัญหาระบบไฟล์ล็อกหรือค้าง
         try:
             gdf = gpd.read_file(shp_path)
         except Exception as read_err:
@@ -78,33 +74,28 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
         if gdf.crs is None:
             gdf.set_crs(epsg=32647, inplace=True) # กำหนดค่าเริ่มต้นเป็น UTM Zone 47N (จ.ลำปาง)
             
-        # 🛠️ [จุดแก้ไขป้องกัน บั๊ก abs() / Timeout]: ดักจับปัญหาตอนแปลงพิกัดและคำนวณพิกัดภูมิศาสตร์
         try:
             gdf_wgs84 = gdf.to_crs(epsg=4326)
             centroid = gdf_wgs84.geometry.centroid.iloc[0]
             
-            # เช็คให้มั่นใจว่าค่าพิกัดลอยตัว (Float) ออกมาจริง ไม่ใช่ตัวแปร Timeout
+            # บังคับเช็คประเภทข้อมูลอย่างเข้มงวด
             lat_val = float(centroid.y)
             lon_val = float(centroid.x)
             
-            # ตรวจสอบว่าพิกัดไม่ได้หลุดไปนอกโลก (ดักจับค่าขยะจาก Timeout หรือพิกัดเพี้ยน)
-            if abs(lat_val) > 90 or abs(lon_val) > 180:
-                raise ValueError("พิกัดแผนที่ที่คำนวณได้เกินขอบเขตจริง")
-                
-            calculated_coords = [lat_val, lon_val]
-        except Exception as geo_err:
-            print(f"เกิดข้อผิดพลาดในการคำนวณระบบพิกัด: {str(geo_err)}")
-            # Fallback ในกรณีประมวลผลพิกัดซับซ้อนไม่ได้ ให้พิกัดศูนย์กลางเมืองลำปางไว้ก่อน หน้าเว็บจะได้ไม่แครช
+            # ดักจับค่าเพี้ยนอย่างปลอดภัย
+            if (isinstance(lat_val, (int, float)) and isinstance(lon_val, (int, float))):
+                calculated_coords = [lat_val, lon_val]
+            else:
+                calculated_coords = [18.29, 99.50]
+        except Exception:
             calculated_coords = [18.29, 99.50] 
             gdf_wgs84 = gdf
             
-        # คำนวณพื้นที่จริง (แปลงเป็นระบบโครงพิกัด UTM Zone 47N เพื่อความแม่นยำสูงสุดในหน่วยตารางเมตร)
+        # คำนวณพื้นที่จริง
         try:
             gdf_utm = gdf.to_crs(epsg=32647)
             area_sqm = float(gdf_utm.geometry.area.sum())
-            
-            # ป้องกันค่าพื้นที่ติดลบหรือค่า Timeout หลุดมาคำนวณคณิตศาสตร์
-            if area_sqm < 0 or not isinstance(area_sqm, (int, float)):
+            if area_sqm < 0:
                 area_sqm = 0.0
         except Exception:
             area_sqm = 0.0
@@ -124,7 +115,6 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
     except HTTPException as http_ex:
         raise http_ex
     except Exception as e:
-        # หากหลุดข้อยกเว้นอื่นใด ให้แจ้งเตือนอย่างเป็นมิตร ป้องกันเออเรอร์ไร้สาระทำระบบล่ม
         raise HTTPException(status_code=500, detail=f"ระบบคำนวณ GIS ขัดข้องชั่วคราว: {str(e)}")
 
 @app.get("/")
@@ -133,7 +123,6 @@ def read_root():
 
 @app.post("/analyze-shapefile/")
 async def analyze_shapefile(file: UploadFile = File(...)):
-    """เส้น API สำหรับดึงค่าพิกัดและคำนวณพื้นที่แสดงพรีวิวบนหน้าจอก่อนที่ผู้ใช้จะกดบันทึกจริง"""
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์บีบอัดประเภท .zip")
         
@@ -173,11 +162,9 @@ async def process_shapefile(
     case_status: str = Form(...),
     agency: str = Form(...),
     suspects_count: int = Form(0),
-    # ฟิลด์เฉพาะคดีบุกรุก
     rai: float = Form(0.0),
     ngarn: float = Form(0.0),
     wa: float = Form(0.0),
-    # ฟิลด์เฉพาะคดีไม้
     timber_type: str = Form(""),
     width: float = Form(0.0),
     length: float = Form(0.0),
@@ -185,9 +172,8 @@ async def process_shapefile(
     vol1: float = Form(0.0),
     vol2: float = Form(0.0)
 ):
-    """เส้น API หลักสำหรับบันทึกข้อมูลและอัปโหลดไฟล์ขนาดใหญ่ด้วยระบบ Hybrid Storage"""
     if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล Supabase (กรุณากรอก Environment Variables บน Render)")
+        raise HTTPException(status_code=500, detail="ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล Supabase")
         
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -198,87 +184,94 @@ async def process_shapefile(
             extract_dir = os.path.join(temp_dir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
             
-            # ดึงโครงพิกัดผังแปลงและการคำนวณ
             gis_result = extract_gis_and_calculate(zip_path, extract_dir)
             gdf_wgs84 = gis_result["gdf_wgs84"]
             calculated_coords = gis_result["coords"]
             
-            # ลดทอนจุดพิกัดที่ซ้ำซ้อนเพื่อย่อยขนาดไฟล์แผนที่ให้เปิดหน้าจอได้เร็วและลื่นไหลขึ้น
             try:
                 gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
             except Exception:
                 pass
 
-            # --- 1. อัปโหลดไฟล์ต้นฉบับ Shapefile (.zip) ขึ้นคลาวด์ Storage ---
-            safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
-            with open(zip_path, "rb") as f_data:
-                supabase.storage.from_("dnp-shapefiles").upload(
-                    path=clean_filename,
-                    file=f_data,
-                    file_options={"cache-control": "3600", "upsert": "true"}
-                )
-            shapefile_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_filename)
-
-            # --- 2. อัปโหลดไฟล์เอกสารสแกนสำนวนคดี (.pdf) ขึ้นคลาวด์ Storage ---
-            pdf_public_url = ""
-            if pdf_file:
-                safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-                pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
-                pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
-                with open(pdf_temp_path, "wb") as pdf_buffer:
-                    shutil.copyfileobj(pdf_file.file, pdf_buffer)
-                
-                with open(pdf_temp_path, "rb") as pdf_data:
-                    supabase.storage.from_("dnp-pdfs").upload(
-                        path=pdf_filename,
-                        file=pdf_data,
+            # 🛠️ ครอบ try-except แยกส่วนเพื่อความปลอดภัยสูงสุดในการอัปโหลดไฟล์ขนาดใหญ่ไปยัง Supabase Storage
+            try:
+                safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+                clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
+                with open(zip_path, "rb") as f_data:
+                    supabase.storage.from_("dnp-shapefiles").upload(
+                        path=clean_filename,
+                        file=f_data,
                         file_options={"cache-control": "3600", "upsert": "true"}
                     )
-                pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
+                shapefile_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_filename)
+            except Exception as e_shp:
+                return {"success": False, "error": f"ปัญหาการอัปโหลดไฟล์พิกัดต้นฉบับ: {str(e_shp)}"}
 
-            # --- 3. ระบบ Hybrid Storage: เขียนแปลงพิกัดออกเป็นไฟล์ JSON ย่อย แยกไปฝากถังเก็บเพื่อป้องกันปัญหา Timeout ---
-            geojson_data = json.loads(gdf_wgs84.to_json())
-            geojson_string = json.dumps(geojson_data, ensure_ascii=False)
-            
-            geojson_filename = f"{case_no.replace('/', '_')}_map.json"
-            geojson_temp_path = os.path.join(temp_dir, geojson_filename)
-            
-            with open(geojson_temp_path, "w", encoding="utf-8") as json_file:
-                json_file.write(geojson_string)
+            pdf_public_url = ""
+            if pdf_file:
+                try:
+                    safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+                    pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
+                    pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
+                    with open(pdf_temp_path, "wb") as pdf_buffer:
+                        shutil.copyfileobj(pdf_file.file, pdf_buffer)
+                    
+                    with open(pdf_temp_path, "rb") as pdf_data:
+                        supabase.storage.from_("dnp-pdfs").upload(
+                            path=pdf_filename,
+                            file=pdf_data,
+                            file_options={"cache-control": "3600", "upsert": "true"}
+                        )
+                    pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
+                except Exception as e_pdf:
+                    print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
+
+            try:
+                geojson_data = json.loads(gdf_wgs84.to_json())
+                geojson_string = json.dumps(geojson_data, ensure_ascii=False)
                 
-            with open(geojson_temp_path, "rb") as json_data:
-                supabase.storage.from_("dnp-shapefiles").upload(
-                    path=geojson_filename,
-                    file=json_data,
-                    file_options={"cache-control": "3600", "upsert": "true"}
-                )
-            geojson_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(geojson_filename)
+                geojson_filename = f"{case_no.replace('/', '_')}_map.json"
+                geojson_temp_path = os.path.join(temp_dir, geojson_filename)
+                
+                with open(geojson_temp_path, "w", encoding="utf-8") as json_file:
+                    json_file.write(geojson_string)
+                    
+                with open(geojson_temp_path, "rb") as json_data:
+                    supabase.storage.from_("dnp-shapefiles").upload(
+                        path=geojson_filename,
+                        file=json_data,
+                        file_options={"cache-control": "3600", "upsert": "true"}
+                    )
+                geojson_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(geojson_filename)
+            except Exception as e_geo:
+                return {"success": False, "error": f"ปัญหาระบบเขียนโครงข่าย GeoJSON: {str(e_geo)}"}
 
-            # --- 4. จัดเตรียมชุดคีย์ข้อมูลและเขียนคำสั่งบันทึกลง Table ข้อมูลสารบบ ---
             is_finished_bool = True if status == 'คดีสิ้นสุด' else False
             
-            if case_type == 'encroachment':
-                db_data = {
-                    "case_no": case_no, "case_date": case_date, "location": location,
-                    "rai": rai, "ngarn": ngarn, "wa": wa, "is_finished": is_finished_bool,
-                    "case_status": case_status, "coords": calculated_coords, "agency": agency,
-                    "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
-                    "pdf_url": pdf_public_url, 
-                    "geojson_data": geojson_public_url
-                }
-                supabase.table("encroachment_cases").insert(db_data).execute()
-            else:
-                db_data = {
-                    "case_no": case_no, "case_date": case_date, "location": location,
-                    "timber_type": timber_type, "width": width, "length": length, "size": size,
-                    "vol_logs": vol1, "vol_processed": vol2, "is_finished": is_finished_bool,
-                    "case_status": case_status, "coords": calculated_coords, "agency": agency,
-                    "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
-                    "pdf_url": pdf_public_url, 
-                    "geojson_data": geojson_public_url
-                }
-                supabase.table("timber_cases").insert(db_data).execute()
+            try:
+                if case_type == 'encroachment':
+                    db_data = {
+                        "case_no": case_no, "case_date": case_date, "location": location,
+                        "rai": rai, "ngarn": ngarn, "wa": wa, "is_finished": is_finished_bool,
+                        "case_status": case_status, "coords": calculated_coords, "agency": agency,
+                        "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                        "pdf_url": pdf_public_url, 
+                        "geojson_data": geojson_public_url
+                    }
+                    supabase.table("encroachment_cases").insert(db_data).execute()
+                else:
+                    db_data = {
+                        "case_no": case_no, "case_date": case_date, "location": location,
+                        "timber_type": timber_type, "width": width, "length": length, "size": size,
+                        "vol_logs": vol1, "vol_processed": vol2, "is_finished": is_finished_bool,
+                        "case_status": case_status, "coords": calculated_coords, "agency": agency,
+                        "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                        "pdf_url": pdf_public_url, 
+                        "geojson_data": geojson_public_url
+                    }
+                    supabase.table("timber_cases").insert(db_data).execute()
+            except Exception as e_db:
+                return {"success": False, "error": f"ปัญหาการบันทึกฐานข้อมูลสารบบ: {str(e_db)}"}
 
             return {
                 "success": True,
