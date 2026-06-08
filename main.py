@@ -88,8 +88,6 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
         total_wa = area_sqm / 4
         rai = int(total_wa // 400)
         ngarn = int((total_wa % 400) // 100)
-        
-        # 🛠️ [จุดแก้ไขที่ 1]: บังคับปัดเศษตารางวาให้กลายเป็น Integer (เลขจำนวนเต็ม) ทันทีตั้งแต่ตอนคำนวณ
         wa = int(round(total_wa % 100))
         
         return {
@@ -180,7 +178,6 @@ async def process_shapefile(
             except Exception:
                 pass
 
-            # --- 1. อัปโหลดไฟล์ต้นฉบับ Shapefile (.zip) ---
             try:
                 safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
                 clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
@@ -194,7 +191,6 @@ async def process_shapefile(
             except Exception as e_shp:
                 return {"success": False, "error": f"ปัญหาการอัปโหลดไฟล์พิกัดต้นฉบับ: {str(e_shp)}"}
 
-            # --- 2. อัปโหลดไฟล์เอกสารสแกนสำนวนคดี (.pdf) ---
             pdf_public_url = ""
             if pdf_file:
                 try:
@@ -214,7 +210,6 @@ async def process_shapefile(
                 except Exception as e_pdf:
                     print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
 
-            # --- 3. ระบบ Hybrid Storage เขียนไฟล์ JSON แปลงพิกัด ---
             try:
                 geojson_data = json.loads(gdf_wgs84.to_json())
                 geojson_string = json.dumps(geojson_data, ensure_ascii=False)
@@ -237,7 +232,6 @@ async def process_shapefile(
 
             is_finished_bool = True if status == 'คดีสิ้นสุด' else False
             
-            # 🛠️ [จุดแก้ไขที่ 2]: บังคับ cast ตัวแปรฝั่งหน้าเว็บ (กรณีกรอกมือ) ให้กลายเป็น int() ทั้งหมดก่อนส่งเข้าตารางคดีบุกรุก
             try:
                 clean_suspects = int(suspects_count)
                 
@@ -248,7 +242,7 @@ async def process_shapefile(
                         "location": location,
                         "rai": int(rai), 
                         "ngarn": int(ngarn), 
-                        "wa": int(round(wa)), # ปลั๊กอินล้างคราบทศนิยมของ ตร.ว. ให้เป็น Integer สอดรับกับ PostgreSQL
+                        "wa": int(round(wa)),
                         "is_finished": is_finished_bool,
                         "case_status": case_status, 
                         "coords": calculated_coords, 
@@ -293,12 +287,92 @@ async def process_shapefile(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
+# ============================================================
+# ✅ NEW: คดีสัตว์ป่า endpoints
+# ============================================================
+
+@app.post("/process-wildlife/")
+async def process_wildlife(
+    pdf_file: UploadFile = File(None),
+    case_no: str = Form(...),
+    case_date: str = Form(...),
+    location: str = Form(...),
+    status: str = Form(...),
+    case_status: str = Form(...),
+    agency: str = Form(...),
+    suspects_count: int = Form(0),
+    wildlife_type: str = Form(""),
+    equipment: str = Form(""),
+    coords_lat: float = Form(0.0),
+    coords_lon: float = Form(0.0)
+):
+    """บันทึกข้อมูลคดีสัตว์ป่า (ไม่ต้องใช้ Shapefile เพราะเป็นจุดเหตุ)"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล Supabase")
+        
+    try:
+        pdf_public_url = ""
+        if pdf_file:
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+                    pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
+                    pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
+                    with open(pdf_temp_path, "wb") as pdf_buffer:
+                        shutil.copyfileobj(pdf_file.file, pdf_buffer)
+                    
+                    with open(pdf_temp_path, "rb") as pdf_data:
+                        supabase.storage.from_("dnp-pdfs").upload(
+                            path=pdf_filename,
+                            file=pdf_data,
+                            file_options={"cache-control": "3600", "upsert": "true"}
+                        )
+                    pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
+            except Exception as e_pdf:
+                print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
+
+        is_finished_bool = True if status == 'คดีสิ้นสุด' else False
+        coords = [coords_lat, coords_lon] if coords_lat != 0.0 or coords_lon != 0.0 else [18.29, 99.50]
+
+        db_data = {
+            "case_no": case_no,
+            "case_date": case_date,
+            "location": location,
+            "wildlife_type": wildlife_type,
+            "equipment": equipment,
+            "is_finished": is_finished_bool,
+            "case_status": case_status,
+            "coords": coords,
+            "agency": agency,
+            "suspects_count": int(suspects_count),
+            "pdf_url": pdf_public_url
+        }
+        supabase.table("wildlife_cases").insert(db_data).execute()
+
+        return {
+            "success": True,
+            "message": "บันทึกข้อมูลคดีสัตว์ป่าสำเร็จ",
+            "coords": coords
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/get-cases/{case_type}")
 async def get_cases(case_type: str):
     if not supabase: 
         raise HTTPException(status_code=500, detail="ฐานข้อมูลยังไม่ได้ตั้งค่าเชื่อมต่อ")
     try:
-        table_name = "encroachment_cases" if case_type == "encroachment" else "timber_cases"
+        if case_type == "encroachment":
+            table_name = "encroachment_cases"
+        elif case_type == "timber":
+            table_name = "timber_cases"
+        elif case_type == "wildlife":
+            table_name = "wildlife_cases"
+        else:
+            raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
         res = supabase.table(table_name).select("*").execute()
         return res.data
     except Exception as e:
@@ -309,7 +383,14 @@ async def delete_case(case_type: str, case_no: str):
     if not supabase: 
         raise HTTPException(status_code=500, detail="ฐานข้อมูลยังไม่ได้ตั้งค่าเชื่อมต่อ")
     try:
-        table_name = "encroachment_cases" if case_type == "encroachment" else "timber_cases"
+        if case_type == "encroachment":
+            table_name = "encroachment_cases"
+        elif case_type == "timber":
+            table_name = "timber_cases"
+        elif case_type == "wildlife":
+            table_name = "wildlife_cases"
+        else:
+            raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
         supabase.table(table_name).delete().eq("case_no", case_no).execute()
         return {"message": "ลบข้อมูลออกจากสารบบคดีสำเร็จ"}
     except Exception as e:
