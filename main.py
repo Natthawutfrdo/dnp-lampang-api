@@ -13,7 +13,6 @@ from supabase import create_client, Client, ClientOptions
 
 app = FastAPI(title="DNP GIS Case API Systems")
 
-# เปิดสิทธิ์ CORS ให้หน้าเว็บ Frontend (เช่น GitHub Pages) สามารถเชื่อมต่อได้
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,22 +21,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 💡 ดึงค่าคอนฟิกเชื่อมต่อฐานข้อมูลจาก Environment Variables ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ [WARNING] ไม่พบค่า SUPABASE_URL หรือ SUPABASE_KEY ในระบบ")
-    print("กรุณาตรวจสอบการกรอกค่าเหล่านี้ในหน้าแดชบอร์ดเมนู Environment บน Render.com เพื่อให้ระบบบันทึกคดีได้")
-
-# 🛠️ [จุดแก้ไขสำคัญ]: ตัดการสร้างออบเจกต์ custom_timeout ของ httpx ออก 
-# เพื่อป้องกันบั๊กลึกของระบบเครือข่าย 'bad operand type for abs(): Timeout'
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        supabase: Optional[Client] = create_client(
-            SUPABASE_URL, 
-            SUPABASE_KEY
-        )
+        supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as init_err:
         print(f"❌ ไม่สามารถเริ่มต้น Supabase Client ได้: {str(init_err)}")
         supabase = None
@@ -72,17 +61,14 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
             raise HTTPException(status_code=400, detail="ไฟล์ Shapefile ไม่มีข้อมูลเชิงพื้นที่")
             
         if gdf.crs is None:
-            gdf.set_crs(epsg=32647, inplace=True) # กำหนดค่าเริ่มต้นเป็น UTM Zone 47N (จ.ลำปาง)
+            gdf.set_crs(epsg=32647, inplace=True)
             
         try:
             gdf_wgs84 = gdf.to_crs(epsg=4326)
             centroid = gdf_wgs84.geometry.centroid.iloc[0]
-            
-            # บังคับเช็คประเภทข้อมูลอย่างเข้มงวด
             lat_val = float(centroid.y)
             lon_val = float(centroid.x)
             
-            # ดักจับค่าเพี้ยนอย่างปลอดภัย
             if (isinstance(lat_val, (int, float)) and isinstance(lon_val, (int, float))):
                 calculated_coords = [lat_val, lon_val]
             else:
@@ -91,7 +77,6 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
             calculated_coords = [18.29, 99.50] 
             gdf_wgs84 = gdf
             
-        # คำนวณพื้นที่จริง
         try:
             gdf_utm = gdf.to_crs(epsg=32647)
             area_sqm = float(gdf_utm.geometry.area.sum())
@@ -193,7 +178,7 @@ async def process_shapefile(
             except Exception:
                 pass
 
-            # 🛠️ ครอบ try-except แยกส่วนเพื่อความปลอดภัยสูงสุดในการอัปโหลดไฟล์ขนาดใหญ่ไปยัง Supabase Storage
+            # --- 1. อัปโหลดไฟล์ต้นฉบับ Shapefile (.zip) ---
             try:
                 safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
                 clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
@@ -207,6 +192,7 @@ async def process_shapefile(
             except Exception as e_shp:
                 return {"success": False, "error": f"ปัญหาการอัปโหลดไฟล์พิกัดต้นฉบับ: {str(e_shp)}"}
 
+            # --- 2. อัปโหลดไฟล์เอกสารสแกนสำนวนคดี (.pdf) ---
             pdf_public_url = ""
             if pdf_file:
                 try:
@@ -226,6 +212,7 @@ async def process_shapefile(
                 except Exception as e_pdf:
                     print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
 
+            # --- 3. ระบบ Hybrid Storage เขียนไฟล์ JSON แปลงพิกัด ---
             try:
                 geojson_data = json.loads(gdf_wgs84.to_json())
                 geojson_string = json.dumps(geojson_data, ensure_ascii=False)
@@ -248,24 +235,48 @@ async def process_shapefile(
 
             is_finished_bool = True if status == 'คดีสิ้นสุด' else False
             
+            # 🛠️ [จุดแก้ไขสำคัญที่สุด]: ล้างจุดทศนิยมและทำความสะอาดตัวเลข (Cast Type) ป้องกันข้อผิดพลาดของตาราง PostgreSQL ของ Supabase
             try:
+                # ปรับให้จำนวนผู้ต้องหาเป็นเลขจำนวนเต็มเสมอ
+                clean_suspects = int(suspects_count)
+                
                 if case_type == 'encroachment':
+                    # สำหรับคดีบุกรุก: ไร่ และ งาน บังคับแปลงเป็น Integer เผื่อฐานข้อมูลกำหนดสิทธิ์ไว้เข้มงวด
                     db_data = {
-                        "case_no": case_no, "case_date": case_date, "location": location,
-                        "rai": rai, "ngarn": ngarn, "wa": wa, "is_finished": is_finished_bool,
-                        "case_status": case_status, "coords": calculated_coords, "agency": agency,
-                        "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                        "case_no": case_no, 
+                        "case_date": case_date, 
+                        "location": location,
+                        "rai": int(rai), 
+                        "ngarn": int(ngarn), 
+                        "wa": float(wa), 
+                        "is_finished": is_finished_bool,
+                        "case_status": case_status, 
+                        "coords": calculated_coords, 
+                        "agency": agency,
+                        "suspects_count": clean_suspects, 
+                        "shapefile_url": shapefile_public_url,
                         "pdf_url": pdf_public_url, 
                         "geojson_data": geojson_public_url
                     }
                     supabase.table("encroachment_cases").insert(db_data).execute()
                 else:
+                    # สำหรับคดีไม้: บังคับแปลงค่าสัดส่วนต่าง ๆ ให้เหมาะสม ป้องกัน 0.0 หลุดเข้าฟิล์ด Integer
                     db_data = {
-                        "case_no": case_no, "case_date": case_date, "location": location,
-                        "timber_type": timber_type, "width": width, "length": length, "size": size,
-                        "vol_logs": vol1, "vol_processed": vol2, "is_finished": is_finished_bool,
-                        "case_status": case_status, "coords": calculated_coords, "agency": agency,
-                        "suspects_count": suspects_count, "shapefile_url": shapefile_public_url,
+                        "case_no": case_no, 
+                        "case_date": case_date, 
+                        "location": location,
+                        "timber_type": timber_type, 
+                        "width": float(width), 
+                        "length": float(length), 
+                        "size": float(size),
+                        "vol_logs": float(vol1), 
+                        "vol_processed": float(vol2), 
+                        "is_finished": is_finished_bool,
+                        "case_status": case_status, 
+                        "coords": calculated_coords, 
+                        "agency": agency,
+                        "suspects_count": clean_suspects, 
+                        "shapefile_url": shapefile_public_url,
                         "pdf_url": pdf_public_url, 
                         "geojson_data": geojson_public_url
                     }
