@@ -34,7 +34,7 @@ else:
     supabase = None
 
 def extract_gis_and_calculate(zip_path: str, extract_dir: str):
-    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา"""
+    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา (แปลงเป็น Integer ทั้งหมด)"""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
@@ -88,7 +88,9 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
         total_wa = area_sqm / 4
         rai = int(total_wa // 400)
         ngarn = int((total_wa % 400) // 100)
-        wa = round(total_wa % 100, 1)
+        
+        # 🛠️ [จุดแก้ไขที่ 1]: บังคับปัดเศษตารางวาให้กลายเป็น Integer (เลขจำนวนเต็ม) ทันทีตั้งแต่ตอนคำนวณ
+        wa = int(round(total_wa % 100))
         
         return {
             "gdf_wgs84": gdf_wgs84,
@@ -235,20 +237,18 @@ async def process_shapefile(
 
             is_finished_bool = True if status == 'คดีสิ้นสุด' else False
             
-            # 🛠️ [จุดแก้ไขสำคัญที่สุด]: ล้างจุดทศนิยมและทำความสะอาดตัวเลข (Cast Type) ป้องกันข้อผิดพลาดของตาราง PostgreSQL ของ Supabase
+            # 🛠️ [จุดแก้ไขที่ 2]: บังคับ cast ตัวแปรฝั่งหน้าเว็บ (กรณีกรอกมือ) ให้กลายเป็น int() ทั้งหมดก่อนส่งเข้าตารางคดีบุกรุก
             try:
-                # ปรับให้จำนวนผู้ต้องหาเป็นเลขจำนวนเต็มเสมอ
                 clean_suspects = int(suspects_count)
                 
                 if case_type == 'encroachment':
-                    # สำหรับคดีบุกรุก: ไร่ และ งาน บังคับแปลงเป็น Integer เผื่อฐานข้อมูลกำหนดสิทธิ์ไว้เข้มงวด
                     db_data = {
                         "case_no": case_no, 
                         "case_date": case_date, 
                         "location": location,
                         "rai": int(rai), 
                         "ngarn": int(ngarn), 
-                        "wa": float(wa), 
+                        "wa": int(round(wa)), # ปลั๊กอินล้างคราบทศนิยมของ ตร.ว. ให้เป็น Integer สอดรับกับ PostgreSQL
                         "is_finished": is_finished_bool,
                         "case_status": case_status, 
                         "coords": calculated_coords, 
@@ -260,7 +260,6 @@ async def process_shapefile(
                     }
                     supabase.table("encroachment_cases").insert(db_data).execute()
                 else:
-                    # สำหรับคดีไม้: บังคับแปลงค่าสัดส่วนต่าง ๆ ให้เหมาะสม ป้องกัน 0.0 หลุดเข้าฟิล์ด Integer
                     db_data = {
                         "case_no": case_no, 
                         "case_date": case_date, 
