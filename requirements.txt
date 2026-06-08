@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-geopandas
-pandas
-shapely
-requests
 python-multipart
+pandas
+geopandas
+shapely
 supabase
+httpx
