@@ -3,13 +3,12 @@ import shutil
 import tempfile
 import zipfile
 import json
+import math
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
 import geopandas as gpd
-from shapely.geometry import mapping
-from supabase import create_client, Client, ClientOptions
+from supabase import create_client, Client
 
 app = FastAPI(title="DNP GIS Case API Systems")
 
@@ -28,370 +27,590 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as init_err:
-        print(f"❌ ไม่สามารถเริ่มต้น Supabase Client ได้: {str(init_err)}")
+        print(f"❌ ไม่สามารถเริ่มต้น Supabase Client: {init_err}")
         supabase = None
 else:
     supabase = None
 
-def extract_gis_and_calculate(zip_path: str, extract_dir: str):
-    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา (แปลงเป็น Integer ทั้งหมด)"""
+
+# =============================================================
+# ✅ ฟังก์ชัน WGS84 (Lat/Lon) → UTM (Pure Python ไม่ต้องลง lib เพิ่ม)
+# =============================================================
+def latlon_to_utm(lat: float, lon: float) -> dict:
+    """
+    แปลงพิกัด WGS84 (Latitude, Longitude) → UTM (Zone, Easting, Northing)
+    ใช้สูตร Transverse Mercator มาตรฐาน WGS84 Ellipsoid
+    """
     try:
+        # คำนวณ Zone อัตโนมัติจากลองจิจูด
+        zone = int((lon + 180) / 6) + 1
+
+        k0    = 0.9996
+        a     = 6378137.0          # WGS84 semi-major axis (เมตร)
+        e     = 0.0818191908426215  # eccentricity
+        e2    = e * e
+        e4    = e2 * e2
+        e6    = e4 * e2
+        e1sq  = e2 / (1 - e2)      # e'^2
+
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        lon_origin_rad = math.radians((zone - 1) * 6 - 180 + 3)
+
+        N = a / math.sqrt(1 - e2 * math.sin(lat_rad) ** 2)
+        T = math.tan(lat_rad) ** 2
+        C = e1sq * math.cos(lat_rad) ** 2
+        A = math.cos(lat_rad) * (lon_rad - lon_origin_rad)
+
+        M = a * (
+            (1 - e2/4 - 3*e4/64 - 5*e6/256)       * lat_rad
+          - (3*e2/8 + 3*e4/32 + 45*e6/1024)        * math.sin(2 * lat_rad)
+          + (15*e4/256 + 45*e6/1024)                * math.sin(4 * lat_rad)
+          - (35*e6/3072)                             * math.sin(6 * lat_rad)
+        )
+
+        easting = k0 * N * (
+            A
+          + (1 - T + C) * A**3 / 6
+          + (5 - 18*T + T**2 + 72*C - 58*e1sq) * A**5 / 120
+        ) + 500000.0
+
+        northing = k0 * (
+            M + N * math.tan(lat_rad) * (
+                A**2 / 2
+              + (5 - T + 9*C + 4*C**2)                      * A**4 / 24
+              + (61 - 58*T + T**2 + 600*C - 330*e1sq)        * A**6 / 720
+            )
+        )
+        # ซีกโลกใต้ให้บวก 10,000,000 เมตร (ไทยอยู่ซีกเหนือ ไม่ต้องบวก)
+        if lat < 0:
+            northing += 10000000.0
+
+        return {
+            "utm_zone":     zone,
+            "utm_easting":  int(round(easting)),
+            "utm_northing": int(round(northing))
+        }
+    except Exception as e:
+        print(f"⚠️ แปลง lat/lon → UTM ผิดพลาด: {e}")
+        return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
+
+
+# =============================================================
+# ✅ ฟังก์ชันหลัก: แตก Shapefile → คำนวณพิกัด + พื้นที่ + UTM
+# =============================================================
+def extract_gis_and_calculate(zip_path: str, extract_dir: str):
+    """
+    ถอดรหัส Shapefile จาก .zip แล้ว:
+      1. หาจุดกึ่งกลาง (Centroid) → Lat/Lon WGS84
+      2. คำนวณพื้นที่ → ไร่-งาน-ตารางวา
+      3. แปลง Centroid → UTM (Zone, Easting, Northing)
+    คืนค่า: dict ที่มีทุก field
+    """
+    try:
+        # แตกไฟล์ zip
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
-            
-        shp_files = [f for f in os.listdir(extract_dir) if f.endswith('.shp')]
+
+        # หาไฟล์ .shp (รองรับ subfolder)
+        shp_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            for f in files:
+                if f.endswith('.shp'):
+                    shp_files.append(os.path.join(root, f))
+
         if not shp_files:
-            for root, dirs, files in os.walk(extract_dir):
-                shp_files = [f for f in files if f.endswith('.shp')]
-                if shp_files:
-                    extract_dir = root
-                    break
-                    
-        if not shp_files:
-            raise HTTPException(status_code=400, detail="ไม่พบไฟล์ .shp ภายในไฟล์ Zip ที่ส่งมา")
-            
-        shp_path = os.path.join(extract_dir, shp_files[0])
-        
+            raise HTTPException(
+                status_code=400,
+                detail="ไม่พบไฟล์ .shp ภายในไฟล์ Zip ที่ส่งมา"
+            )
+
+        shp_path = shp_files[0]
+
+        # อ่าน shapefile
         try:
             gdf = gpd.read_file(shp_path)
         except Exception as read_err:
-            raise HTTPException(status_code=400, detail=f"ไม่สามารถเปิดอ่านไฟล์ Shapefile ได้: {str(read_err)}")
-        
+            raise HTTPException(
+                status_code=400,
+                detail=f"ไม่สามารถเปิดอ่านไฟล์ Shapefile: {read_err}"
+            )
+
         if gdf.empty:
-            raise HTTPException(status_code=400, detail="ไฟล์ Shapefile ไม่มีข้อมูลเชิงพื้นที่")
-            
+            raise HTTPException(
+                status_code=400,
+                detail="ไฟล์ Shapefile ไม่มีข้อมูลเชิงพื้นที่"
+            )
+
+        # กำหนด CRS ถ้าไม่มี (สมมติ UTM Zone 47N สำหรับลำปาง)
         if gdf.crs is None:
-            gdf.set_crs(epsg=32647, inplace=True)
-            
+            gdf = gdf.set_crs(epsg=32647)
+
+        # ----- [1] หา Centroid ใน WGS84 (EPSG:4326) -----
         try:
-            gdf_wgs84 = gdf.to_crs(epsg=4326)
-            centroid = gdf_wgs84.geometry.centroid.iloc[0]
-            lat_val = float(centroid.y)
-            lon_val = float(centroid.x)
-            
-            if (isinstance(lat_val, (int, float)) and isinstance(lon_val, (int, float))):
-                calculated_coords = [lat_val, lon_val]
-            else:
-                calculated_coords = [18.29, 99.50]
+            gdf_wgs84    = gdf.to_crs(epsg=4326)
+            centroid     = gdf_wgs84.geometry.centroid.iloc[0]
+            lat_val      = float(centroid.y)
+            lon_val      = float(centroid.x)
+            calculated_coords = [lat_val, lon_val]
         except Exception:
-            calculated_coords = [18.29, 99.50] 
+            calculated_coords = [18.29, 99.50]
             gdf_wgs84 = gdf
-            
+
+        # ----- [2] คำนวณพื้นที่ใน UTM (EPSG:32647) -----
         try:
-            gdf_utm = gdf.to_crs(epsg=32647)
+            gdf_utm  = gdf.to_crs(epsg=32647)
             area_sqm = float(gdf_utm.geometry.area.sum())
-            if area_sqm < 0:
-                area_sqm = 0.0
+            area_sqm = max(area_sqm, 0.0)
         except Exception:
             area_sqm = 0.0
-        
-        total_wa = area_sqm / 4
-        rai = int(total_wa // 400)
-        ngarn = int((total_wa % 400) // 100)
-        wa = int(round(total_wa % 100))
-        
-        return {
-            "gdf_wgs84": gdf_wgs84,
-            "coords": calculated_coords,
-            "rai": rai,
-            "ngarn": ngarn,
-            "wa": wa
-        }
-    except HTTPException as http_ex:
-        raise http_ex
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ระบบคำนวณ GIS ขัดข้องชั่วคราว: {str(e)}")
 
+        total_wa = area_sqm / 4.0
+        rai      = int(total_wa // 400)
+        ngarn    = int((total_wa % 400) // 100)
+        wa       = int(round(total_wa % 100))
+
+        # ----- [3] แปลง Centroid → UTM -----
+        utm_result = latlon_to_utm(calculated_coords[0], calculated_coords[1])
+
+        return {
+            "gdf_wgs84":    gdf_wgs84,
+            "coords":       calculated_coords,
+            "rai":          rai,
+            "ngarn":        ngarn,
+            "wa":           wa,
+            # ✅ เพิ่ม UTM
+            "utm_zone":     utm_result["utm_zone"],
+            "utm_easting":  utm_result["utm_easting"],
+            "utm_northing": utm_result["utm_northing"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ระบบคำนวณ GIS ขัดข้อง: {e}"
+        )
+
+
+# =============================================================
+# Endpoint: GET /
+# =============================================================
 @app.get("/")
 def read_root():
-    return {"message": "DNP GIS Case API is running successfully!"}
+    return {"message": "DNP GIS Case API is running!"}
 
+
+# =============================================================
+# Endpoint: POST /analyze-shapefile/
+# (วิเคราะห์ไฟล์ Shapefile เบื้องต้น ก่อนบันทึกจริง)
+# =============================================================
 @app.post("/analyze-shapefile/")
 async def analyze_shapefile(file: UploadFile = File(...)):
     if not file.filename.endswith('.zip'):
-        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์บีบอัดประเภท .zip")
-        
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = os.path.join(temp_dir, file.filename)
-            with open(zip_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-                
-            extract_dir = os.path.join(temp_dir, "extracted")
-            os.makedirs(extract_dir, exist_ok=True)
-            
-            gis_result = extract_gis_and_calculate(zip_path, extract_dir)
-            
-            return {
-                "success": True,
-                "lat": gis_result["coords"][0],
-                "lon": gis_result["coords"][1],
-                "rai": gis_result["rai"],
-                "ngarn": gis_result["ngarn"],
-                "wa": gis_result["wa"]
-            }
-    except HTTPException as status_err:
-        raise status_err
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail="กรุณาอัปโหลดไฟล์ .zip เท่านั้น"
+        )
 
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, file.filename)
+        with open(zip_path, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+
+        extract_dir = os.path.join(temp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        gis = extract_gis_and_calculate(zip_path, extract_dir)
+
+        # ✅ คืนค่า UTM กลับไปให้ Frontend ด้วย
+        return {
+            "success":      True,
+            "lat":          gis["coords"][0],
+            "lon":          gis["coords"][1],
+            "rai":          gis["rai"],
+            "ngarn":        gis["ngarn"],
+            "wa":           gis["wa"],
+            "utm_zone":     gis["utm_zone"],
+            "utm_easting":  gis["utm_easting"],
+            "utm_northing": gis["utm_northing"],
+        }
+
+
+# =============================================================
+# Endpoint: POST /process-shapefile/
+# (บันทึกคดีบุกรุก / คดีไม้ พร้อม Shapefile)
+# =============================================================
 @app.post("/process-shapefile/")
 async def process_shapefile(
-    file: UploadFile = File(...),
-    pdf_file: UploadFile = File(None),
-    case_type: str = Form(...),
-    case_no: str = Form(...),
-    case_date: str = Form(...),
-    location: str = Form(...),
-    status: str = Form(...),
-    case_status: str = Form(...),
-    agency: str = Form(...),
-    suspects_count: int = Form(0),
-    rai: float = Form(0.0),
-    ngarn: float = Form(0.0),
-    wa: float = Form(0.0),
-    timber_type: str = Form(""),
-    width: float = Form(0.0),
-    length: float = Form(0.0),
-    size: float = Form(0.0),
-    vol1: float = Form(0.0),
-    vol2: float = Form(0.0)
+    file:           UploadFile = File(...),
+    pdf_file:       UploadFile = File(None),
+    case_type:      str   = Form(...),
+    case_no:        str   = Form(...),
+    case_date:      str   = Form(...),
+    location:       str   = Form(...),
+    status:         str   = Form(...),
+    case_status:    str   = Form(...),
+    agency:         str   = Form(...),
+    suspects_count: int   = Form(0),
+    rai:            float = Form(0.0),
+    ngarn:          float = Form(0.0),
+    wa:             float = Form(0.0),
+    timber_type:    str   = Form(""),
+    width:          float = Form(0.0),
+    length:         float = Form(0.0),
+    size:           float = Form(0.0),
+    vol1:           float = Form(0.0),
+    vol2:           float = Form(0.0),
+    # ✅ รับ UTM จาก Frontend (ที่ผู้ใช้กรอกมือ หรือได้จาก analyze-shapefile)
+    utm_zone:       int   = Form(47),
+    utm_easting:    int   = Form(0),
+    utm_northing:   int   = Form(0),
 ):
     if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล Supabase")
-        
+        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
+
+            # --- บันทึกไฟล์ zip ---
             zip_path = os.path.join(temp_dir, file.filename)
-            with open(zip_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
+            with open(zip_path, "wb") as buf:
+                shutil.copyfileobj(file.file, buf)
+
             extract_dir = os.path.join(temp_dir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
-            
-            gis_result = extract_gis_and_calculate(zip_path, extract_dir)
-            gdf_wgs84 = gis_result["gdf_wgs84"]
-            calculated_coords = gis_result["coords"]
-            
+
+            # --- ประมวลผล GIS ---
+            gis = extract_gis_and_calculate(zip_path, extract_dir)
+            gdf_wgs84         = gis["gdf_wgs84"]
+            calculated_coords = gis["coords"]
+
+            # ✅ ถ้าผู้ใช้ไม่ได้กรอก UTM เอง ให้ใช้ค่าที่คำนวณจาก Shapefile
+            final_utm_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
+            final_utm_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
+            final_utm_northing = utm_northing if utm_northing != 0 else gis["utm_northing"]
+
+            # ✅ ถ้าช่องพื้นที่ยังเป็น 0 ให้ใช้ค่าจาก Shapefile
+            final_rai   = int(rai)   if rai   > 0 else gis["rai"]
+            final_ngarn = int(ngarn) if ngarn > 0 else gis["ngarn"]
+            final_wa    = int(round(wa)) if wa > 0 else gis["wa"]
+
+            # --- Simplify geometry ---
             try:
-                gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+                gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(
+                    tolerance=0.0001, preserve_topology=True
+                )
             except Exception:
                 pass
 
+            # --- อัปโหลด Shapefile zip ต้นฉบับ ---
+            clean_fn = f"{case_no.replace('/', '_')}_{file.filename.replace(' ', '_')}"
             try:
-                safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-                clean_filename = f"{case_no.replace('/', '_')}_{safe_filename}"
                 with open(zip_path, "rb") as f_data:
                     supabase.storage.from_("dnp-shapefiles").upload(
-                        path=clean_filename,
+                        path=clean_fn,
                         file=f_data,
                         file_options={"cache-control": "3600", "upsert": "true"}
                     )
-                shapefile_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_filename)
-            except Exception as e_shp:
-                return {"success": False, "error": f"ปัญหาการอัปโหลดไฟล์พิกัดต้นฉบับ: {str(e_shp)}"}
+                shapefile_url = supabase.storage.from_("dnp-shapefiles").get_public_url(clean_fn)
+            except Exception as e:
+                return {"success": False, "error": f"อัปโหลด Shapefile ผิดพลาด: {e}"}
 
-            pdf_public_url = ""
+            # --- อัปโหลด PDF (ถ้ามี) ---
+            pdf_url = ""
             if pdf_file:
                 try:
-                    safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-                    pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
-                    pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
-                    with open(pdf_temp_path, "wb") as pdf_buffer:
-                        shutil.copyfileobj(pdf_file.file, pdf_buffer)
-                    
-                    with open(pdf_temp_path, "rb") as pdf_data:
+                    pdf_fn       = f"{case_no.replace('/', '_')}_{pdf_file.filename.replace(' ', '_')}"
+                    pdf_tmp_path = os.path.join(temp_dir, pdf_fn)
+                    with open(pdf_tmp_path, "wb") as buf:
+                        shutil.copyfileobj(pdf_file.file, buf)
+                    with open(pdf_tmp_path, "rb") as pd:
                         supabase.storage.from_("dnp-pdfs").upload(
-                            path=pdf_filename,
-                            file=pdf_data,
+                            path=pdf_fn, file=pd,
                             file_options={"cache-control": "3600", "upsert": "true"}
                         )
-                    pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
-                except Exception as e_pdf:
-                    print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
+                    pdf_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_fn)
+                except Exception as e:
+                    print(f"⚠️ อัปโหลด PDF ล้มเหลว: {e}")
 
+            # --- สร้างและอัปโหลด GeoJSON ---
             try:
-                geojson_data = json.loads(gdf_wgs84.to_json())
-                geojson_string = json.dumps(geojson_data, ensure_ascii=False)
-                
-                geojson_filename = f"{case_no.replace('/', '_')}_map.json"
-                geojson_temp_path = os.path.join(temp_dir, geojson_filename)
-                
-                with open(geojson_temp_path, "w", encoding="utf-8") as json_file:
-                    json_file.write(geojson_string)
-                    
-                with open(geojson_temp_path, "rb") as json_data:
+                geojson_fn   = f"{case_no.replace('/', '_')}_map.json"
+                geojson_str  = gdf_wgs84.to_json()
+                geojson_path = os.path.join(temp_dir, geojson_fn)
+                with open(geojson_path, "w", encoding="utf-8") as jf:
+                    jf.write(geojson_str)
+                with open(geojson_path, "rb") as jd:
                     supabase.storage.from_("dnp-shapefiles").upload(
-                        path=geojson_filename,
-                        file=json_data,
+                        path=geojson_fn, file=jd,
                         file_options={"cache-control": "3600", "upsert": "true"}
                     )
-                geojson_public_url = supabase.storage.from_("dnp-shapefiles").get_public_url(geojson_filename)
-            except Exception as e_geo:
-                return {"success": False, "error": f"ปัญหาระบบเขียนโครงข่าย GeoJSON: {str(e_geo)}"}
+                geojson_url = supabase.storage.from_("dnp-shapefiles").get_public_url(geojson_fn)
+            except Exception as e:
+                return {"success": False, "error": f"สร้าง GeoJSON ผิดพลาด: {e}"}
 
-            is_finished_bool = True if status == 'คดีสิ้นสุด' else False
-            
+            # --- บันทึกลง Supabase Database ---
+            is_finished = (status == "คดีสิ้นสุด")
+
             try:
-                clean_suspects = int(suspects_count)
-                
-                if case_type == 'encroachment':
+                if case_type == "encroachment":
                     db_data = {
-                        "case_no": case_no, 
-                        "case_date": case_date, 
-                        "location": location,
-                        "rai": int(rai), 
-                        "ngarn": int(ngarn), 
-                        "wa": int(round(wa)),
-                        "is_finished": is_finished_bool,
-                        "case_status": case_status, 
-                        "coords": calculated_coords, 
-                        "agency": agency,
-                        "suspects_count": clean_suspects, 
-                        "shapefile_url": shapefile_public_url,
-                        "pdf_url": pdf_public_url, 
-                        "geojson_data": geojson_public_url
+                        "case_no":        case_no,
+                        "case_date":      case_date,
+                        "location":       location,
+                        "rai":            final_rai,
+                        "ngarn":          final_ngarn,
+                        "wa":             final_wa,
+                        "is_finished":    is_finished,
+                        "case_status":    case_status,
+                        "coords":         calculated_coords,
+                        "agency":         agency,
+                        "suspects_count": int(suspects_count),
+                        "shapefile_url":  shapefile_url,
+                        "pdf_url":        pdf_url,
+                        "geojson_data":   geojson_url,
+                        # ✅ เพิ่ม UTM
+                        "utm_zone":       final_utm_zone,
+                        "utm_easting":    final_utm_easting,
+                        "utm_northing":   final_utm_northing,
                     }
                     supabase.table("encroachment_cases").insert(db_data).execute()
-                else:
+
+                elif case_type == "timber":
                     db_data = {
-                        "case_no": case_no, 
-                        "case_date": case_date, 
-                        "location": location,
-                        "timber_type": timber_type, 
-                        "width": float(width), 
-                        "length": float(length), 
-                        "size": float(size),
-                        "vol_logs": float(vol1), 
-                        "vol_processed": float(vol2), 
-                        "is_finished": is_finished_bool,
-                        "case_status": case_status, 
-                        "coords": calculated_coords, 
-                        "agency": agency,
-                        "suspects_count": clean_suspects, 
-                        "shapefile_url": shapefile_public_url,
-                        "pdf_url": pdf_public_url, 
-                        "geojson_data": geojson_public_url
+                        "case_no":        case_no,
+                        "case_date":      case_date,
+                        "location":       location,
+                        "timber_type":    timber_type,
+                        "width":          float(width),
+                        "length":         float(length),
+                        "size":           float(size),
+                        "vol_logs":       float(vol1),
+                        "vol_processed":  float(vol2),
+                        "is_finished":    is_finished,
+                        "case_status":    case_status,
+                        "coords":         calculated_coords,
+                        "agency":         agency,
+                        "suspects_count": int(suspects_count),
+                        "shapefile_url":  shapefile_url,
+                        "pdf_url":        pdf_url,
+                        "geojson_data":   geojson_url,
+                        # ✅ เพิ่ม UTM
+                        "utm_zone":       final_utm_zone,
+                        "utm_easting":    final_utm_easting,
+                        "utm_northing":   final_utm_northing,
                     }
                     supabase.table("timber_cases").insert(db_data).execute()
-            except Exception as e_db:
-                return {"success": False, "error": f"ปัญหาการบันทึกฐานข้อมูลสารบบ: {str(e_db)}"}
+
+            except Exception as e:
+                return {"success": False, "error": f"บันทึก Database ผิดพลาด: {e}"}
 
             return {
-                "success": True,
-                "message": "ประมวลผลและจัดเก็บพิกัดแผนที่สารบบคดีเสร็จสิ้น",
-                "coords": calculated_coords,
-                "geojson_url": geojson_public_url
+                "success":      True,
+                "message":      "บันทึกข้อมูลสำเร็จ",
+                "coords":       calculated_coords,
+                "geojson_url":  geojson_url,
+                "utm_zone":     final_utm_zone,
+                "utm_easting":  final_utm_easting,
+                "utm_northing": final_utm_northing,
             }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-# ============================================================
-# ✅ NEW: คดีสัตว์ป่า endpoints
-# ============================================================
-
+# =============================================================
+# Endpoint: POST /process-wildlife/
+# (บันทึกคดีสัตว์ป่า ใช้พิกัดจุด ไม่มี Shapefile)
+# =============================================================
 @app.post("/process-wildlife/")
 async def process_wildlife(
-    pdf_file: UploadFile = File(None),
-    case_no: str = Form(...),
-    case_date: str = Form(...),
-    location: str = Form(...),
-    status: str = Form(...),
-    case_status: str = Form(...),
-    agency: str = Form(...),
-    suspects_count: int = Form(0),
-    wildlife_type: str = Form(""),
-    equipment: str = Form(""),
-    coords_lat: float = Form(0.0),
-    coords_lon: float = Form(0.0)
+    pdf_file:       UploadFile = File(None),
+    case_no:        str   = Form(...),
+    case_date:      str   = Form(...),
+    location:       str   = Form(...),
+    status:         str   = Form(...),
+    case_status:    str   = Form(...),
+    agency:         str   = Form(...),
+    suspects_count: int   = Form(0),
+    wildlife_type:  str   = Form(""),
+    equipment:      str   = Form(""),
+    coords_lat:     float = Form(0.0),
+    coords_lon:     float = Form(0.0),
+    # ✅ รับ UTM จาก Frontend
+    utm_zone:       int   = Form(47),
+    utm_easting:    int   = Form(0),
+    utm_northing:   int   = Form(0),
 ):
-    """บันทึกข้อมูลคดีสัตว์ป่า (ไม่ต้องใช้ Shapefile เพราะเป็นจุดเหตุ)"""
     if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล Supabase")
-        
+        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+
     try:
-        pdf_public_url = ""
+        # --- อัปโหลด PDF ---
+        pdf_url = ""
         if pdf_file:
             try:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    safe_pdf_filename = pdf_file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-                    pdf_filename = f"{case_no.replace('/', '_')}_{safe_pdf_filename}"
-                    pdf_temp_path = os.path.join(temp_dir, pdf_file.filename)
-                    with open(pdf_temp_path, "wb") as pdf_buffer:
-                        shutil.copyfileobj(pdf_file.file, pdf_buffer)
-                    
-                    with open(pdf_temp_path, "rb") as pdf_data:
+                with tempfile.TemporaryDirectory() as tmp:
+                    pdf_fn   = f"{case_no.replace('/', '_')}_{pdf_file.filename.replace(' ', '_')}"
+                    pdf_path = os.path.join(tmp, pdf_fn)
+                    with open(pdf_path, "wb") as buf:
+                        shutil.copyfileobj(pdf_file.file, buf)
+                    with open(pdf_path, "rb") as pd:
                         supabase.storage.from_("dnp-pdfs").upload(
-                            path=pdf_filename,
-                            file=pdf_data,
+                            path=pdf_fn, file=pd,
                             file_options={"cache-control": "3600", "upsert": "true"}
                         )
-                    pdf_public_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_filename)
-            except Exception as e_pdf:
-                print(f"คำเตือนอัปโหลด PDF ล้มเหลว: {str(e_pdf)}")
+                    pdf_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_fn)
+            except Exception as e:
+                print(f"⚠️ อัปโหลด PDF ล้มเหลว: {e}")
 
-        is_finished_bool = True if status == 'คดีสิ้นสุด' else False
-        coords = [coords_lat, coords_lon] if coords_lat != 0.0 or coords_lon != 0.0 else [18.29, 99.50]
+        is_finished = (status == "คดีสิ้นสุด")
+        coords = (
+            [coords_lat, coords_lon]
+            if (coords_lat != 0.0 or coords_lon != 0.0)
+            else [18.29, 99.50]
+        )
+
+        # ✅ ถ้าผู้ใช้ไม่ได้กรอก UTM แต่มี Lat/Lon → คำนวณ UTM อัตโนมัติ
+        final_utm_zone     = utm_zone
+        final_utm_easting  = utm_easting
+        final_utm_northing = utm_northing
+
+        if utm_easting == 0 and utm_northing == 0 and coords_lat != 0.0:
+            utm_auto = latlon_to_utm(coords[0], coords[1])
+            final_utm_zone     = utm_auto["utm_zone"]
+            final_utm_easting  = utm_auto["utm_easting"]
+            final_utm_northing = utm_auto["utm_northing"]
+
+        # ✅ ถ้าผู้ใช้กรอก UTM แต่ไม่มี Lat/Lon → แปลง UTM → Lat/Lon
+        if coords_lat == 0.0 and utm_easting != 0:
+            try:
+                ll = utm_to_latlon_python(utm_zone, utm_easting, utm_northing)
+                coords = [ll["lat"], ll["lon"]]
+            except Exception:
+                coords = [18.29, 99.50]
 
         db_data = {
-            "case_no": case_no,
-            "case_date": case_date,
-            "location": location,
-            "wildlife_type": wildlife_type,
-            "equipment": equipment,
-            "is_finished": is_finished_bool,
-            "case_status": case_status,
-            "coords": coords,
-            "agency": agency,
+            "case_no":        case_no,
+            "case_date":      case_date,
+            "location":       location,
+            "wildlife_type":  wildlife_type,
+            "equipment":      equipment,
+            "is_finished":    is_finished,
+            "case_status":    case_status,
+            "coords":         coords,
+            "agency":         agency,
             "suspects_count": int(suspects_count),
-            "pdf_url": pdf_public_url
+            "pdf_url":        pdf_url,
+            # ✅ เพิ่ม UTM
+            "utm_zone":       final_utm_zone,
+            "utm_easting":    final_utm_easting,
+            "utm_northing":   final_utm_northing,
         }
         supabase.table("wildlife_cases").insert(db_data).execute()
 
         return {
-            "success": True,
-            "message": "บันทึกข้อมูลคดีสัตว์ป่าสำเร็จ",
-            "coords": coords
+            "success":      True,
+            "message":      "บันทึกข้อมูลคดีสัตว์ป่าสำเร็จ",
+            "coords":       coords,
+            "utm_zone":     final_utm_zone,
+            "utm_easting":  final_utm_easting,
+            "utm_northing": final_utm_northing,
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
+# Helper: UTM → Lat/Lon (ฝั่ง Python สำหรับกรณีกรอก UTM แต่ไม่มี Lat/Lon)
+def utm_to_latlon_python(zone: int, easting: float, northing: float,
+                          is_north: bool = True) -> dict:
+    k0   = 0.9996
+    a    = 6378137.0
+    e    = 0.0818191908426215
+    e2   = e * e
+    e4   = e2 * e2
+    e6   = e4 * e2
+    e1sq = e2 / (1 - e2)
+
+    x = easting - 500000.0
+    y = northing if is_north else northing - 10000000.0
+
+    lon_origin = (zone - 1) * 6 - 180 + 3
+    M   = y / k0
+    mu  = M / (a * (1 - e2/4 - 3*e4/64 - 5*e6/256))
+
+    phi1 = (mu
+        + (3/2*e2 + 27/32*e4 + 55/512*e6) * math.sin(2*mu)
+        + (21/16*e4 + 55/32*e6)            * math.sin(4*mu)
+        + (151/96*e6)                        * math.sin(6*mu))
+
+    N1 = a / math.sqrt(1 - e2 * math.sin(phi1)**2)
+    T1 = math.tan(phi1)**2
+    C1 = e1sq * math.cos(phi1)**2
+    R1 = a * (1 - e2) / (1 - e2 * math.sin(phi1)**2)**1.5
+    D  = x / (N1 * k0)
+
+    lat = phi1 - (N1 * math.tan(phi1) / R1) * (
+        D**2/2
+        - (5 + 3*T1 + 10*C1 - 4*C1**2 - 9*e1sq)              * D**4/24
+        + (61 + 90*T1 + 298*C1 + 45*T1**2 - 252*e1sq - 3*C1**2) * D**6/720
+    )
+    lon = (
+        D
+        - (1 + 2*T1 + C1) * D**3/6
+        + (5 - 2*C1 + 28*T1 - 3*C1**2 + 8*e1sq + 24*T1**2) * D**5/120
+    ) / math.cos(phi1)
+
+    return {
+        "lat": math.degrees(lat),
+        "lon": lon_origin + math.degrees(lon)
+    }
+
+
+# =============================================================
+# Endpoint: GET /get-cases/{case_type}
+# =============================================================
 @app.get("/get-cases/{case_type}")
 async def get_cases(case_type: str):
-    if not supabase: 
-        raise HTTPException(status_code=500, detail="ฐานข้อมูลยังไม่ได้ตั้งค่าเชื่อมต่อ")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+
+    table_map = {
+        "encroachment": "encroachment_cases",
+        "timber":       "timber_cases",
+        "wildlife":     "wildlife_cases",
+    }
+    if case_type not in table_map:
+        raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
+
     try:
-        if case_type == "encroachment":
-            table_name = "encroachment_cases"
-        elif case_type == "timber":
-            table_name = "timber_cases"
-        elif case_type == "wildlife":
-            table_name = "wildlife_cases"
-        else:
-            raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
-        res = supabase.table(table_name).select("*").execute()
+        res = supabase.table(table_map[case_type]).select("*").execute()
         return res.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================
+# Endpoint: DELETE /delete-case/{case_type}/{case_no}
+# =============================================================
 @app.delete("/delete-case/{case_type}/{case_no}")
 async def delete_case(case_type: str, case_no: str):
-    if not supabase: 
-        raise HTTPException(status_code=500, detail="ฐานข้อมูลยังไม่ได้ตั้งค่าเชื่อมต่อ")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+
+    table_map = {
+        "encroachment": "encroachment_cases",
+        "timber":       "timber_cases",
+        "wildlife":     "wildlife_cases",
+    }
+    if case_type not in table_map:
+        raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
+
     try:
-        if case_type == "encroachment":
-            table_name = "encroachment_cases"
-        elif case_type == "timber":
-            table_name = "timber_cases"
-        elif case_type == "wildlife":
-            table_name = "wildlife_cases"
-        else:
-            raise HTTPException(status_code=400, detail="ประเภทคดีไม่ถูกต้อง")
-        supabase.table(table_name).delete().eq("case_no", case_no).execute()
-        return {"message": "ลบข้อมูลออกจากสารบบคดีสำเร็จ"}
+        supabase.table(table_map[case_type]).delete().eq("case_no", case_no).execute()
+        return {"message": f"ลบข้อมูลคดี {case_no} สำเร็จ"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
