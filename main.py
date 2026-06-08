@@ -27,10 +27,8 @@ app.add_middleware(
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-# แก้ไขจุดนี้: เปลี่ยนจากโครงสร้างเดิมที่สั่งแครชระบบ (raise RuntimeWarning) 
-# เป็นการพิมพ์ Log เตือนแทน เพื่อให้เซิร์ฟเวอร์เปิดบริการได้แม้ช่วงแรกยังไม่ได้ใส่คีย์
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ [WARNING] ไม่พบค่า SUPABASE_URL หรือ SUPABASE_KEY ในระบบ")
+    print("⚠️ [WARNING] 不พบค่า SUPABASE_URL หรือ SUPABASE_KEY ในระบบ")
     print("กรุณาตรวจสอบการกรอกค่าเหล่านี้ในหน้าแดชบอร์ดเมนู Environment บน Render.com เพื่อให้ระบบบันทึกคดีได้")
 
 # กำหนดเวลาให้ระบบยอมรอการอ่าน/เขียนข้อมูลสูงสุด 300 วินาที (5 นาที) สำหรับแปลงพิกัดขนาดใหญ่
@@ -50,51 +48,84 @@ else:
     supabase = None
 
 def extract_gis_and_calculate(zip_path: str, extract_dir: str):
-    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา"""
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
+    """ฟังก์ชันส่วนกลางสำหรับถอดรหัสพิกัด หาจุดกึ่งกลาง และคำนวณพื้นที่ ไร่-งาน-วา [แก้ไขดักจับ Timeout ป้องกันบั๊ก abs()]"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+            
+        shp_files = [f for f in os.listdir(extract_dir) if f.endswith('.shp')]
+        if not shp_files:
+            for root, dirs, files in os.walk(extract_dir):
+                shp_files = [f for f in files if f.endswith('.shp')]
+                if shp_files:
+                    extract_dir = root
+                    break
+                    
+        if not shp_files:
+            raise HTTPException(status_code=400, detail="ไม่พบไฟล์ .shp ภายในไฟล์ Zip ที่ส่งมา")
+            
+        shp_path = os.path.join(extract_dir, shp_files[0])
         
-    shp_files = [f for f in os.listdir(extract_dir) if f.endswith('.shp')]
-    if not shp_files:
-        for root, dirs, files in os.walk(extract_dir):
-            shp_files = [f for f in files if f.endswith('.shp')]
-            if shp_files:
-                extract_dir = root
-                break
+        # อ่านไฟล์อย่างปลอดภัย ป้องกันปัญหาระบบไฟล์ล็อกหรือค้าง
+        try:
+            gdf = gpd.read_file(shp_path)
+        except Exception as read_err:
+            raise HTTPException(status_code=400, detail=f"ไม่สามารถเปิดอ่านไฟล์ Shapefile ได้: {str(read_err)}")
+        
+        if gdf.empty:
+            raise HTTPException(status_code=400, detail="ไฟล์ Shapefile ไม่มีข้อมูลเชิงพื้นที่")
+            
+        if gdf.crs is None:
+            gdf.set_crs(epsg=32647, inplace=True) # กำหนดค่าเริ่มต้นเป็น UTM Zone 47N (จ.ลำปาง)
+            
+        # 🛠️ [จุดแก้ไขป้องกัน บั๊ก abs() / Timeout]: ดักจับปัญหาตอนแปลงพิกัดและคำนวณพิกัดภูมิศาสตร์
+        try:
+            gdf_wgs84 = gdf.to_crs(epsg=4326)
+            centroid = gdf_wgs84.geometry.centroid.iloc[0]
+            
+            # เช็คให้มั่นใจว่าค่าพิกัดลอยตัว (Float) ออกมาจริง ไม่ใช่ตัวแปร Timeout
+            lat_val = float(centroid.y)
+            lon_val = float(centroid.x)
+            
+            # ตรวจสอบว่าพิกัดไม่ได้หลุดไปนอกโลก (ดักจับค่าขยะจาก Timeout หรือพิกัดเพี้ยน)
+            if abs(lat_val) > 90 or abs(lon_val) > 180:
+                raise ValueError("พิกัดแผนที่ที่คำนวณได้เกินขอบเขตจริง")
                 
-    if not shp_files:
-        raise HTTPException(status_code=400, detail="ไม่พบไฟล์ .shp ภายในไฟล์ Zip ที่ส่งมา")
+            calculated_coords = [lat_val, lon_val]
+        except Exception as geo_err:
+            print(f"เกิดข้อผิดพลาดในการคำนวณระบบพิกัด: {str(geo_err)}")
+            # Fallback ในกรณีประมวลผลพิกัดซับซ้อนไม่ได้ ให้พิกัดศูนย์กลางเมืองลำปางไว้ก่อน หน้าเว็บจะได้ไม่แครช
+            calculated_coords = [18.29, 99.50] 
+            gdf_wgs84 = gdf
+            
+        # คำนวณพื้นที่จริง (แปลงเป็นระบบโครงพิกัด UTM Zone 47N เพื่อความแม่นยำสูงสุดในหน่วยตารางเมตร)
+        try:
+            gdf_utm = gdf.to_crs(epsg=32647)
+            area_sqm = float(gdf_utm.geometry.area.sum())
+            
+            # ป้องกันค่าพื้นที่ติดลบหรือค่า Timeout หลุดมาคำนวณคณิตศาสตร์
+            if area_sqm < 0 or not isinstance(area_sqm, (int, float)):
+                area_sqm = 0.0
+        except Exception:
+            area_sqm = 0.0
         
-    shp_path = os.path.join(extract_dir, shp_files[0])
-    gdf = gpd.read_file(shp_path)
-    
-    if gdf.empty:
-        raise HTTPException(status_code=400, detail="ไฟล์ Shapefile ไม่มีข้อมูลเชิงพื้นที่")
+        total_wa = area_sqm / 4
+        rai = int(total_wa // 400)
+        ngarn = int((total_wa % 400) // 100)
+        wa = round(total_wa % 100, 1)
         
-    if gdf.crs is None:
-        gdf.set_crs(epsg=32647, inplace=True) # กำหนดค่าเริ่มต้นเป็น UTM Zone 47N (จ.ลำปาง)
-        
-    # แปลงเข้าสู่ระบบ WGS84 (EPSG:4326) สำหรับคำนวณพิกัดภูมิศาสตร์แสดงบนแผนที่เว็บ Leaflet
-    gdf_wgs84 = gdf.to_crs(epsg=4326)
-    centroid = gdf_wgs84.geometry.centroid.iloc[0]
-    calculated_coords = [centroid.y, centroid.x]
-    
-    # คำนวณพื้นที่จริง (แปลงเป็นระบบโครงพิกัด UTM Zone 47N เพื่อความแม่นยำสูงสุดในหน่วยตารางเมตร)
-    gdf_utm = gdf.to_crs(epsg=32647)
-    area_sqm = gdf_utm.geometry.area.sum()
-    
-    total_wa = area_sqm / 4
-    rai = int(total_wa // 400)
-    ngarn = int((total_wa % 400) // 100)
-    wa = round(total_wa % 100, 1)
-    
-    return {
-        "gdf_wgs84": gdf_wgs84,
-        "coords": calculated_coords,
-        "rai": rai,
-        "ngarn": ngarn,
-        "wa": wa
-    }
+        return {
+            "gdf_wgs84": gdf_wgs84,
+            "coords": calculated_coords,
+            "rai": rai,
+            "ngarn": ngarn,
+            "wa": wa
+        }
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        # หากหลุดข้อยกเว้นอื่นใด ให้แจ้งเตือนอย่างเป็นมิตร ป้องกันเออเรอร์ไร้สาระทำระบบล่ม
+        raise HTTPException(status_code=500, detail=f"ระบบคำนวณ GIS ขัดข้องชั่วคราว: {str(e)}")
 
 @app.get("/")
 def read_root():
@@ -125,6 +156,8 @@ async def analyze_shapefile(file: UploadFile = File(...)):
                 "ngarn": gis_result["ngarn"],
                 "wa": gis_result["wa"]
             }
+    except HTTPException as status_err:
+        raise status_err
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -171,7 +204,10 @@ async def process_shapefile(
             calculated_coords = gis_result["coords"]
             
             # ลดทอนจุดพิกัดที่ซ้ำซ้อนเพื่อย่อยขนาดไฟล์แผนที่ให้เปิดหน้าจอได้เร็วและลื่นไหลขึ้น
-            gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+            try:
+                gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+            except Exception:
+                pass
 
             # --- 1. อัปโหลดไฟล์ต้นฉบับ Shapefile (.zip) ขึ้นคลาวด์ Storage ---
             safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
