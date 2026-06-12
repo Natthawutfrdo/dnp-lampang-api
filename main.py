@@ -33,9 +33,27 @@ else:
     supabase = None
 
 
-# =============================================================
-# ✅ Helper: UTM → Lat/Lon
-# =============================================================
+# ─────────────────────────────────────────────────────────────
+# Helper: ตรวจสอบว่าคอลัมน์มีอยู่ใน Supabase จริงหรือไม่
+# ─────────────────────────────────────────────────────────────
+def check_columns_exist(table: str, columns: list[str]) -> list[str]:
+    """
+    คืนค่า list ของคอลัมน์ที่มีอยู่จริงในตาราง
+    โดย query ข้อมูล 0 แถวแล้วดู keys ที่ได้กลับมา
+    """
+    if not supabase:
+        return []
+    try:
+        res = supabase.table(table).select(",".join(columns)).limit(0).execute()
+        # ถ้า query ผ่านโดยไม่ error แสดงว่าคอลัมน์มีอยู่
+        return columns
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────
+# Helper: UTM → Lat/Lon
+# ─────────────────────────────────────────────────────────────
 def utm_to_latlon_python(zone: int, easting: float, northing: float,
                           is_north: bool = True) -> dict:
     k0   = 0.9996
@@ -81,9 +99,9 @@ def utm_to_latlon_python(zone: int, easting: float, northing: float,
     }
 
 
-# =============================================================
-# ✅ Helper: Lat/Lon → UTM
-# =============================================================
+# ─────────────────────────────────────────────────────────────
+# Helper: Lat/Lon → UTM
+# ─────────────────────────────────────────────────────────────
 def latlon_to_utm(lat: float, lon: float) -> dict:
     try:
         zone = int((lon + 180) / 6) + 1
@@ -137,9 +155,9 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
         return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
 
 
-# =============================================================
-# ✅ Helper: แตก Shapefile → คำนวณพิกัด + พื้นที่ + UTM
-# =============================================================
+# ─────────────────────────────────────────────────────────────
+# Helper: แตก Shapefile → คำนวณพิกัด + พื้นที่ + UTM
+# ─────────────────────────────────────────────────────────────
 def extract_gis_and_calculate(zip_path: str, extract_dir: str):
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -208,17 +226,17 @@ def extract_gis_and_calculate(zip_path: str, extract_dir: str):
         raise HTTPException(status_code=500, detail=f"ระบบคำนวณ GIS ขัดข้อง: {e}")
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: GET /
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 @app.get("/")
 def read_root():
     return {"message": "DNP GIS Case API is running!"}
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: POST /analyze-shapefile/
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 @app.post("/analyze-shapefile/")
 async def analyze_shapefile(file: UploadFile = File(...)):
     if not file.filename.endswith('.zip'):
@@ -247,20 +265,22 @@ async def analyze_shapefile(file: UploadFile = File(...)):
         }
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: POST /process-shapefile/
-# ✅ แก้ไข:
-#   - เพิ่ม complaint_no (เลขคำแจ้งความ), criminal_no (เลขคดีอาญา),
-#     seizure_no (ยึดทรัพย์) แทน case_no เดิม
-#   - ใช้ complaint_no เป็น key หลักสำหรับ filename / ค้นหา
-#   - แก้ bug is_finished ให้รับทั้ง "คดีสิ้นสุด" และ "finished"
-# =============================================================
+#
+# ✅ แก้ปัญหา PGRST204 Schema Cache:
+#   - ตรวจสอบก่อนว่าคอลัมน์ complaint_no / criminal_no / seizure_no
+#     มีอยู่ในตารางจริงหรือไม่
+#   - ถ้ามี → ใส่ field ครบทั้ง 3
+#   - ถ้ายังไม่มี → fall back ใช้ case_no แทน (ระบบยังทำงานได้)
+#   - เก็บ complaint_no, criminal_no, seizure_no ไว้ใน case_status
+#     เพื่อไม่ให้ข้อมูลหาย แม้ schema ยังไม่ได้ upgrade
+# ─────────────────────────────────────────────────────────────
 @app.post("/process-shapefile/")
 async def process_shapefile(
     file:           UploadFile = File(...),
     pdf_file:       UploadFile = File(None),
     case_type:      str   = Form(...),
-    # ✅ ฟิลด์ใหม่ทั้ง 3 แทน case_no เดิม
     complaint_no:   str   = Form(""),   # เลขคำแจ้งความที่
     criminal_no:    str   = Form(""),   # เลขคดีอาญาที่
     seizure_no:     str   = Form(""),   # ยึดทรัพย์ที่
@@ -286,13 +306,23 @@ async def process_shapefile(
     if not supabase:
         raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
 
-    # ✅ ใช้ complaint_no เป็น key หลัก (หรือ criminal_no ถ้าไม่มี)
+    # ─── key หลักสำหรับตั้งชื่อไฟล์ ───
     primary_key = complaint_no or criminal_no or "unknown"
     safe_key    = primary_key.replace('/', '_').replace(' ', '_')
+
+    # ─── ตรวจสอบว่า schema มีคอลัมน์ใหม่แล้วหรือยัง ───
+    new_cols_exist = False
+    if case_type == "encroachment":
+        existing = check_columns_exist(
+            "encroachment_cases",
+            ["complaint_no", "criminal_no", "seizure_no"]
+        )
+        new_cols_exist = len(existing) == 3
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
 
+            # ─── บันทึกและแตก Shapefile ───
             zip_path = os.path.join(temp_dir, file.filename)
             with open(zip_path, "wb") as buf:
                 shutil.copyfileobj(file.file, buf)
@@ -304,14 +334,15 @@ async def process_shapefile(
             gdf_wgs84         = gis["gdf_wgs84"]
             calculated_coords = gis["coords"]
 
-            final_utm_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
-            final_utm_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
+            final_utm_zone     = utm_zone     if utm_easting  != 0 else gis["utm_zone"]
+            final_utm_easting  = utm_easting  if utm_easting  != 0 else gis["utm_easting"]
             final_utm_northing = utm_northing if utm_northing != 0 else gis["utm_northing"]
 
-            final_rai   = int(rai)        if rai   > 0 else gis["rai"]
-            final_ngarn = int(ngarn)      if ngarn > 0 else gis["ngarn"]
-            final_wa    = int(round(wa))  if wa    > 0 else gis["wa"]
+            final_rai   = int(rai)       if rai   > 0 else gis["rai"]
+            final_ngarn = int(ngarn)     if ngarn > 0 else gis["ngarn"]
+            final_wa    = int(round(wa)) if wa    > 0 else gis["wa"]
 
+            # ─── Simplify geometry เพื่อลดขนาด GeoJSON ───
             try:
                 gdf_wgs84['geometry'] = gdf_wgs84['geometry'].simplify(
                     tolerance=0.0001, preserve_topology=True
@@ -319,7 +350,7 @@ async def process_shapefile(
             except Exception:
                 pass
 
-            # อัปโหลด Shapefile zip
+            # ─── อัปโหลด Shapefile zip ───
             clean_fn = f"{safe_key}_{file.filename.replace(' ', '_')}"
             try:
                 with open(zip_path, "rb") as f_data:
@@ -331,7 +362,7 @@ async def process_shapefile(
             except Exception as e:
                 return {"success": False, "error": f"อัปโหลด Shapefile ผิดพลาด: {e}"}
 
-            # อัปโหลด PDF (ถ้ามี)
+            # ─── อัปโหลด PDF (ถ้ามี) ───
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 try:
@@ -348,7 +379,7 @@ async def process_shapefile(
                 except Exception as e:
                     print(f"⚠️ อัปโหลด PDF ล้มเหลว: {e}")
 
-            # สร้างและอัปโหลด GeoJSON
+            # ─── สร้างและอัปโหลด GeoJSON ───
             try:
                 geojson_fn   = f"{safe_key}_map.json"
                 geojson_str  = gdf_wgs84.to_json()
@@ -364,18 +395,16 @@ async def process_shapefile(
             except Exception as e:
                 return {"success": False, "error": f"สร้าง GeoJSON ผิดพลาด: {e}"}
 
-            # ✅ แก้ bug: ตรวจสอบสถานะอย่างครอบคลุม
+            # ─── ตรวจสอบสถานะคดี ───
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
 
+            # ─── บันทึก Database ───
             try:
                 if case_type == "encroachment":
+
+                    # ✅ base fields ที่มีอยู่แน่นอนในทุก schema version
                     db_data = {
-                        # ✅ ฟิลด์ใหม่ 3 ฟิลด์
-                        "complaint_no":   complaint_no,
-                        "criminal_no":    criminal_no,
-                        "seizure_no":     seizure_no,
-                        # ยังคง case_no ไว้ = complaint_no เพื่อ backward-compatible
-                        "case_no":        complaint_no,
+                        "case_no":        complaint_no or criminal_no,
                         "case_date":      case_date,
                         "location":       location,
                         "rai":            final_rai,
@@ -393,6 +422,29 @@ async def process_shapefile(
                         "utm_easting":    final_utm_easting,
                         "utm_northing":   final_utm_northing,
                     }
+
+                    # ✅ เพิ่ม 3 คอลัมน์ใหม่เฉพาะเมื่อ schema พร้อมแล้ว
+                    if new_cols_exist:
+                        db_data["complaint_no"] = complaint_no
+                        db_data["criminal_no"]  = criminal_no
+                        db_data["seizure_no"]   = seizure_no
+                    else:
+                        # schema ยังไม่ได้ upgrade → เก็บข้อมูลใน case_status แทน
+                        # เพื่อไม่ให้ข้อมูลสูญหาย
+                        extra_info = ""
+                        if complaint_no:
+                            extra_info += f"\n[เลขคำแจ้งความ: {complaint_no}]"
+                        if criminal_no:
+                            extra_info += f"\n[เลขคดีอาญา: {criminal_no}]"
+                        if seizure_no:
+                            extra_info += f"\n[ยึดทรัพย์ที่: {seizure_no}]"
+                        if extra_info:
+                            db_data["case_status"] = case_status + extra_info
+                        print(
+                            "⚠️ คอลัมน์ complaint_no/criminal_no/seizure_no ยังไม่มีใน schema "
+                            "→ ใช้ case_no แทน และบันทึกเลขคดีไว้ใน case_status"
+                        )
+
                     supabase.table("encroachment_cases").insert(db_data).execute()
 
                 elif case_type == "timber":
@@ -424,22 +476,23 @@ async def process_shapefile(
                 return {"success": False, "error": f"บันทึก Database ผิดพลาด: {e}"}
 
             return {
-                "success":      True,
-                "message":      "บันทึกข้อมูลสำเร็จ",
-                "coords":       calculated_coords,
-                "geojson_url":  geojson_url,
-                "utm_zone":     final_utm_zone,
-                "utm_easting":  final_utm_easting,
-                "utm_northing": final_utm_northing,
+                "success":          True,
+                "message":          "บันทึกข้อมูลสำเร็จ",
+                "coords":           calculated_coords,
+                "geojson_url":      geojson_url,
+                "utm_zone":         final_utm_zone,
+                "utm_easting":      final_utm_easting,
+                "utm_northing":     final_utm_northing,
+                "schema_upgraded":  new_cols_exist,
             }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: POST /process-wildlife/
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 @app.post("/process-wildlife/")
 async def process_wildlife(
     pdf_file:       UploadFile = File(None),
@@ -479,7 +532,6 @@ async def process_wildlife(
             except Exception as e:
                 print(f"⚠️ อัปโหลด PDF ล้มเหลว: {e}")
 
-        # ✅ แก้ bug is_finished
         is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
 
         coords = (
@@ -536,9 +588,9 @@ async def process_wildlife(
         return {"success": False, "error": str(e)}
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: GET /get-cases/{case_type}
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 @app.get("/get-cases/{case_type}")
 async def get_cases(case_type: str):
     if not supabase:
@@ -559,9 +611,9 @@ async def get_cases(case_type: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 # Endpoint: DELETE /delete-case/{case_type}/{case_no}
-# =============================================================
+# ─────────────────────────────────────────────────────────────
 @app.delete("/delete-case/{case_type}/{case_no}")
 async def delete_case(case_type: str, case_no: str):
     if not supabase:
@@ -580,3 +632,26 @@ async def delete_case(case_type: str, case_no: str):
         return {"message": f"ลบข้อมูลคดี {case_no} สำเร็จ"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoint: POST /reload-schema/
+# ✅ เพิ่มใหม่: บังคับ reload PostgREST schema cache ผ่าน API
+# ─────────────────────────────────────────────────────────────
+@app.post("/reload-schema/")
+async def reload_schema():
+    """
+    ส่ง NOTIFY ไปยัง PostgREST เพื่อ reload schema cache
+    ใช้หลังจาก ALTER TABLE เพิ่มคอลัมน์ใหม่
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+    try:
+        supabase.rpc("pg_notify", {"channel": "pgrst", "payload": "reload schema"}).execute()
+        return {"success": True, "message": "ส่งคำสั่ง reload schema แล้ว"}
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"ไม่สามารถ reload ผ่าน RPC ได้: {e}. "
+                       "กรุณาไปที่ Supabase Dashboard → Settings → API → Reload Schema Cache"
+        }
