@@ -26,7 +26,7 @@ app = FastAPI(title="DNP GIS Case API Systems", version="3.2")
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
-    "https://your-frontend-domain.com,http://localhost:3000,http://127.0.0.1:5500"
+    "https://natthawutfrdo.github.io,http://localhost:3000,http://127.0.0.1:5500"
 ).split(",")
 
 app.add_middleware(
