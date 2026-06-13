@@ -93,7 +93,7 @@ async def validate_file(file: UploadFile, allowed_ext: str, max_bytes: int = MAX
     return content
 
 # ─────────────────────────────────────────────────────────────
-# UTM helpers (ไม่เปลี่ยนจาก original)
+# UTM helpers
 # ─────────────────────────────────────────────────────────────
 def utm_to_latlon_python(zone: int, easting: float, northing: float,
                           is_north: bool = True) -> dict:
@@ -320,9 +320,9 @@ async def process_shapefile(
                     pdf_tmp = os.path.join(tmp, pdf_fn)
                     with open(pdf_tmp, "wb") as buf:
                         shutil.copyfileobj(pdf_file.file, buf)
-                    with open(pdf_tmp, "rb") as pd:
+                    with open(pdf_tmp, "rb") as pd_file_data:
                         supabase.storage.from_("dnp-pdfs").upload(
-                            path=pdf_fn, file=pd,
+                            path=pdf_fn, file=pd_file_data,
                             file_options={"cache-control": "3600", "upsert": "true"}
                         )
                     pdf_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_fn)
@@ -452,9 +452,9 @@ async def process_wildlife(
                 pdf_path = os.path.join(tmp, pdf_fn)
                 with open(pdf_path, "wb") as buf:
                     shutil.copyfileobj(pdf_file.file, buf)
-                with open(pdf_path, "rb") as pd:
+                with open(pdf_path, "rb") as pd_file_data:
                     supabase.storage.from_("dnp-pdfs").upload(
-                        path=pdf_fn, file=pd,
+                        path=pdf_fn, file=pd_file_data,
                         file_options={"cache-control": "3600", "upsert": "true"}
                     )
                 pdf_url = supabase.storage.from_("dnp-pdfs").get_public_url(pdf_fn)
