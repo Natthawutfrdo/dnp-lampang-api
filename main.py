@@ -5,24 +5,24 @@ DNP GIS Case API — Production v4.1
 🔧 v4.1: แก้ validate_file นามสกุลไฟล์ (เพิ่มจุดนำหน้า ext)
 🔧 v4.1: เพิ่ม /debug-multipolygon/ endpoint สำหรับ debug MultiPolygon
 """
- 
+
 import os, shutil, tempfile, zipfile, json, math, time, logging, glob, traceback
 from typing import Optional, List
 from functools import lru_cache
- 
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 import geopandas as gpd
 from supabase import create_client, Client
- 
+
 # ─────────────────────────────────────────────────
 # 1. LOGGING
 # ─────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
- 
+
 # ─────────────────────────────────────────────────
 # 2. APP + MIDDLEWARE
 # ─────────────────────────────────────────────────
@@ -33,7 +33,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
- 
+
 # ── CORS ──────────────────────────────────────────
 ALLOWED_ORIGINS: List[str] = [
     o.strip()
@@ -44,7 +44,7 @@ ALLOWED_ORIGINS: List[str] = [
     if o.strip()
 ]
 log.info(f"✅ CORS origins: {ALLOWED_ORIGINS}")
- 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -53,9 +53,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
- 
+
 app.add_middleware(GZipMiddleware, minimum_size=1000)
- 
+
 # ─────────────────────────────────────────────────
 # 3. SUPABASE CLIENT
 # ─────────────────────────────────────────────────
@@ -63,7 +63,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 MAX_FILE_MB  = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_BYTES    = MAX_FILE_MB * 1024 * 1024
- 
+
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -73,18 +73,18 @@ if SUPABASE_URL and SUPABASE_KEY:
         log.error(f"❌ Supabase init error: {e}")
 else:
     log.warning("⚠️  SUPABASE_URL / SUPABASE_KEY not set")
- 
+
 def get_db() -> Client:
     if not supabase:
         raise HTTPException(503, detail="ฐานข้อมูลยังไม่ได้เชื่อมต่อ")
     return supabase
- 
+
 # ─────────────────────────────────────────────────
 # 4. SCHEMA CACHE
 # ─────────────────────────────────────────────────
 _schema_cache: dict[str, tuple[bool, float]] = {}
 SCHEMA_TTL = 300  # 5 นาที
- 
+
 def check_columns(table: str, columns: list[str]) -> bool:
     key = f"{table}:{','.join(sorted(columns))}"
     now = time.time()
@@ -101,10 +101,10 @@ def check_columns(table: str, columns: list[str]) -> bool:
     except Exception:
         _schema_cache[key] = (False, now)
         return False
- 
+
 def clear_schema_cache():
     _schema_cache.clear()
- 
+
 # ─────────────────────────────────────────────────
 # 5. TABLE MAP
 # ─────────────────────────────────────────────────
@@ -113,12 +113,12 @@ TABLE_MAP = {
     "timber":       "timber_cases",
     "wildlife":     "wildlife_cases",
 }
- 
+
 def get_table(case_type: str) -> str:
     if case_type not in TABLE_MAP:
         raise HTTPException(400, f"case_type ต้องเป็น: {', '.join(TABLE_MAP.keys())}")
     return TABLE_MAP[case_type]
- 
+
 # ─────────────────────────────────────────────────
 # 6. FILE VALIDATION
 # 🔧 FIX: normalize ext ให้มีจุดเสมอ ไม่ว่าจะส่งมาว่า "zip" หรือ ".zip"
@@ -136,7 +136,7 @@ async def validate_file(
         raise HTTPException(413, f"ไฟล์ใหญ่เกิน {max_bytes // 1024 // 1024} MB")
     await file.seek(0)
     return content
- 
+
 # ─────────────────────────────────────────────────
 # 7. UTM / LAT-LON HELPERS
 # ─────────────────────────────────────────────────
@@ -164,7 +164,7 @@ def utm_to_latlon(zone: int, easting: float, northing: float, is_north: bool = T
     lon = (D - (1+2*T1+C1)*D**3/6
            + (5-2*C1+28*T1-3*C1**2+8*e1sq+24*T1**2)*D**5/120)/math.cos(phi1)
     return {"lat": math.degrees(lat), "lon": lon0 + math.degrees(lon)}
- 
+
 def latlon_to_utm(lat: float, lon: float) -> dict:
     """แปลง Lat/Lon → UTM (WGS84)"""
     try:
@@ -191,7 +191,7 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
     except Exception as err:
         log.warning(f"latlon→UTM error: {err}")
         return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
- 
+
 # ─────────────────────────────────────────────────
 # 8. GIS EXTRACTION
 # ─────────────────────────────────────────────────
@@ -202,13 +202,13 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
             z.extractall(extract_dir)
     except Exception:
         raise HTTPException(400, "ไฟล์ ZIP ไม่สมบูรณ์หรือเสียหาย")
- 
+
     shp_files = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
     if not shp_files:
         shp_files = glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
     if not shp_files:
         raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
- 
+
     # copy ไฟล์ทั้งหมดไปไว้ใน safe_dir ที่ชื่อ ASCII ล้วน
     original_shp = shp_files[0]
     shp_dir = os.path.dirname(original_shp)
@@ -225,55 +225,109 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     if not os.path.exists(shp_path):
         shp_path = original_shp
     log.info(f"[GIS] reading: {shp_path}")
- 
-    # ── อ่านด้วย fiona โดยตรง (รองรับ fiona 1.9+) ────────────────
+
+    # ── อ่านด้วย fiona โดยตรง (รองรับ fiona 1.9+ และ encoding หลายแบบ) ──
     try:
         import fiona
         from shapely.geometry import shape
         from shapely.validation import make_valid
- 
-        with fiona.open(shp_path, encoding="utf-8") as src:
+
+        # 🔧 FIX 1: ลอง encoding หลายแบบ — .dbf ไฟล์ไทยมักเป็น TIS-620 / CP874
+        # ถ้า utf-8 ล้มเหลว ให้ลอง encoding อื่นต่อไปเรื่อยๆ
+        _ENCODINGS = ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]
+        src_ctx = None
+        last_enc_err = None
+        for enc in _ENCODINGS:
+            try:
+                src_ctx = fiona.open(shp_path, encoding=enc)
+                # ทดสอบอ่าน feature แรกจริงๆ เพื่อยืนยัน encoding ใช้ได้
+                _ = list(src_ctx)
+                src_ctx.close()
+                src_ctx = fiona.open(shp_path, encoding=enc)   # เปิดใหม่เพื่ออ่านจริง
+                log.info(f"[GIS] encoding ok: {enc}")
+                break
+            except (UnicodeDecodeError, UnicodeError) as ue:
+                last_enc_err = ue
+                log.warning(f"[GIS] encoding {enc} failed: {ue}")
+                if src_ctx:
+                    try: src_ctx.close()
+                    except Exception: pass
+                src_ctx = None
+            except Exception:
+                # error อื่นที่ไม่ใช่ encoding — หยุดลอง
+                if src_ctx:
+                    try: src_ctx.close()
+                    except Exception: pass
+                src_ctx = None
+                break
+
+        if src_ctx is None:
+            raise HTTPException(
+                400,
+                f"อ่านไฟล์ .dbf ไม่ได้ — ลอง encoding แล้ว: {', '.join(_ENCODINGS)}"
+                + (f" | error: {last_enc_err}" if last_enc_err else "")
+            )
+
+        with src_ctx as src:
             crs_wkt = src.crs_wkt
             features = []
             for feat in src:
-                # fiona 1.9+ ใช้ feat["geometry"] แทน feat.geometry
-                raw_geom = feat["geometry"] if "geometry" in feat else getattr(feat, "geometry", None)
+                # 🔧 FIX 2: fiona 1.9+ geometry เป็น dict / MappingProxyType
+                # ไม่ใช่ bytes → ใช้ feat["geometry"] และส่งตรงให้ shapely shape()
+                # (shape() รับ dict ได้โดยตรง ไม่ต้องแปลง)
+                raw_geom = None
+                if "geometry" in feat:
+                    raw_geom = feat["geometry"]          # fiona 1.9+ (dict)
+                elif hasattr(feat, "geometry"):
+                    raw_geom = feat.geometry             # fiona legacy
+
+                geom = None
                 if raw_geom is not None:
                     try:
+                        # shape() รับ dict หรือ __geo_interface__ ได้เลย
                         geom = shape(raw_geom)
-                        # ซ่อม geometry ที่ invalid (เช่น self-intersection)
                         if not geom.is_valid:
                             geom = make_valid(geom)
+                    except TypeError as te:
+                        # 🔧 FIX 3: "expected bytes, str found" — raw_geom เป็น str แทน dict
+                        # เกิดจาก fiona บางเวอร์ชั่นส่ง WKT string แทน GeoJSON dict
+                        log.warning(f"[GIS] shape(dict) TypeError: {te} — ลอง WKT")
+                        try:
+                            from shapely import wkt as swkt
+                            geom = swkt.loads(str(raw_geom))
+                            if not geom.is_valid:
+                                geom = make_valid(geom)
+                        except Exception as wkt_e:
+                            log.warning(f"[GIS] WKT fallback failed: {wkt_e}")
+                            geom = None
                     except Exception as eg:
                         log.warning(f"[GIS] shape() error: {eg}")
                         geom = None
-                else:
-                    geom = None
- 
+
                 props = dict(feat.properties) if hasattr(feat, "properties") else {}
                 features.append({"geometry": geom, **props})
- 
+
             log.info(f"[GIS] fiona ok: {len(features)} features, crs={src.crs}")
- 
+
         if not features:
             raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
- 
+
         gdf = gpd.GeoDataFrame(features, geometry="geometry")
         if crs_wkt:
             gdf = gdf.set_crs(crs_wkt, allow_override=True)
         elif gdf.crs is None:
             gdf = gdf.set_crs(epsg=32647)
             log.info("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
- 
+
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"[GIS] fiona failed: {e}")
         raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e}")
- 
+
     if gdf.geometry.isna().all():
         raise HTTPException(400, "Shapefile มีข้อมูลแต่ geometry ว่างทั้งหมด")
- 
+
     # ── แปลงพิกัด → WGS84 ────────────────────────
     try:
         gdf84 = gdf.to_crs(epsg=4326)
@@ -282,24 +336,24 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     except Exception:
         lat, lon = 18.29, 99.50
         gdf84 = gdf
- 
+
     # ── คำนวณพื้นที่ ──────────────────────────────
     try:
         area_sqm = max(float(gdf.to_crs(epsg=32647).geometry.area.sum()), 0.0)
     except Exception:
         area_sqm = 0.0
- 
+
     total_wa = area_sqm / 4.0
     rai   = int(total_wa // 400)
     ngarn = int((total_wa % 400) // 100)
     wa    = int(round(total_wa % 100))
- 
+
     # ── Simplify สำหรับ GeoJSON ────────────────────
     try:
         gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
         pass
- 
+
     utm = latlon_to_utm(lat, lon)
     return {
         "gdf84": gdf84,
@@ -307,7 +361,7 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
         "rai": rai, "ngarn": ngarn, "wa": wa,
         **utm,
     }
- 
+
 # ─────────────────────────────────────────────────
 # 9. STORAGE UPLOAD HELPER
 # ─────────────────────────────────────────────────
@@ -330,11 +384,11 @@ def upload_to_storage(
             },
         )
     return db.storage.from_(bucket).get_public_url(path)
- 
+
 # ─────────────────────────────────────────────────
 # 10. ENDPOINTS
 # ─────────────────────────────────────────────────
- 
+
 @app.get("/", tags=["Health"])
 def root():
     return {
@@ -342,7 +396,7 @@ def root():
         "status": "ok",
         "version": "4.1",
     }
- 
+
 @app.get("/health", tags=["Health"])
 def health():
     return {
@@ -350,7 +404,7 @@ def health():
         "db": "connected" if supabase else "disconnected",
         "cors_origins": ALLOWED_ORIGINS,
     }
- 
+
 # ── วิเคราะห์ Shapefile (ไม่บันทึก DB) ──────────
 @app.post("/analyze-shapefile/", tags=["GIS"])
 async def analyze_shapefile(file: UploadFile = File(...)):
@@ -371,7 +425,7 @@ async def analyze_shapefile(file: UploadFile = File(...)):
         "utm_easting":  gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
     }
- 
+
 # ── บันทึกคดีบุกรุก / ไม้ ───────────────────────
 @app.post("/process-shapefile/", tags=["Cases"])
 async def process_shapefile(
@@ -405,21 +459,21 @@ async def process_shapefile(
     zip_content = await validate_file(file, "zip")
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
- 
+
     primary_key = complaint_no or criminal_no or "unknown"
     safe_key    = primary_key.replace("/", "_").replace(" ", "_")
- 
+
     new_cols = (case_type == "encroachment") and check_columns(
         "encroachment_cases", ["complaint_no", "criminal_no", "seizure_no"]
     )
- 
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = os.path.join(tmp, "upload.zip")
             with open(zip_path, "wb") as buf:
                 buf.write(zip_content)
             gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
- 
+
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
             f_northing = utm_northing if utm_northing != 0 else gis["utm_northing"]
@@ -427,13 +481,13 @@ async def process_shapefile(
             f_ngarn    = int(ngarn)     if ngarn > 0 else gis["ngarn"]
             f_wa       = int(round(wa)) if wa    > 0 else gis["wa"]
             coords     = [gis["lat"], gis["lon"]]
- 
+
             clean_shp = f"{safe_key}_{file.filename.replace(' ', '_')}"
             try:
                 shp_url = upload_to_storage(db, "dnp-shapefiles", clean_shp, zip_path)
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"อัปโหลด Shapefile ล้มเหลว: {e}"})
- 
+
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 pdf_fn  = f"{safe_key}_{pdf_file.filename.replace(' ', '_')}"
@@ -444,7 +498,7 @@ async def process_shapefile(
                     pdf_url = upload_to_storage(db, "dnp-pdfs", pdf_fn, pdf_tmp, "application/pdf")
                 except Exception as e:
                     log.warning(f"PDF upload failed: {e}")
- 
+
             geojson_fn   = f"{safe_key}_map.json"
             geojson_path = os.path.join(tmp, geojson_fn)
             with open(geojson_path, "w", encoding="utf-8") as jf:
@@ -455,9 +509,9 @@ async def process_shapefile(
                 )
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"สร้าง GeoJSON ล้มเหลว: {e}"})
- 
+
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
- 
+
             try:
                 if case_type == "encroachment":
                     row: dict = {
@@ -491,7 +545,7 @@ async def process_shapefile(
                         if extra:
                             row["case_status"] = case_status + extra
                     db.table("encroachment_cases").insert(row).execute()
- 
+
                 elif case_type == "timber":
                     db.table("timber_cases").insert({
                         "case_no":        complaint_no or criminal_no,
@@ -515,10 +569,10 @@ async def process_shapefile(
                         "utm_easting":    f_easting,
                         "utm_northing":   f_northing,
                     }).execute()
- 
+
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"บันทึก DB ล้มเหลว: {e}"})
- 
+
             return {
                 "success":         True,
                 "message":         "บันทึกข้อมูลสำเร็จ",
@@ -531,13 +585,13 @@ async def process_shapefile(
                 "utm_northing":    f_northing,
                 "schema_upgraded": new_cols,
             }
- 
+
     except HTTPException:
         raise
     except Exception as e:
         log.exception("process_shapefile error")
         return JSONResponse({"success": False, "error": str(e)})
- 
+
 # ── บันทึกคดีสัตว์ป่า ───────────────────────────
 @app.post("/process-wildlife/", tags=["Cases"])
 async def process_wildlife(
@@ -570,10 +624,10 @@ async def process_wildlife(
                 pdf_url = upload_to_storage(db, "dnp-pdfs", pdf_fn, pdf_path, "application/pdf")
         except Exception as e:
             log.warning(f"Wildlife PDF upload failed: {e}")
- 
+
     is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
     coords      = [coords_lat, coords_lon] if (coords_lat or coords_lon) else [18.29, 99.50]
- 
+
     f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
     if utm_easting == 0 and coords_lat:
         u = latlon_to_utm(coords[0], coords[1])
@@ -584,7 +638,7 @@ async def process_wildlife(
             coords = [ll["lat"], ll["lon"]]
         except Exception:
             coords = [18.29, 99.50]
- 
+
     try:
         db.table("wildlife_cases").insert({
             "case_no":        case_no,
@@ -612,7 +666,7 @@ async def process_wildlife(
         }
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
- 
+
 # ── ดึงรายการคดี ─────────────────────────────────
 @app.get("/get-cases/{case_type}", tags=["Cases"])
 async def get_cases(
@@ -640,7 +694,7 @@ async def get_cases(
         }
     except Exception as e:
         raise HTTPException(500, str(e))
- 
+
 # ── ลบคดี ────────────────────────────────────────
 @app.delete("/delete-case/{case_type}/{case_no}", tags=["Cases"])
 async def delete_case(
@@ -654,7 +708,7 @@ async def delete_case(
         return {"success": True, "message": f"ลบคดี {case_no} เรียบร้อย"}
     except Exception as e:
         raise HTTPException(500, str(e))
- 
+
 # ── UTM Converter endpoint ────────────────────────
 @app.get("/convert-utm", tags=["Utils"])
 def convert_utm_api(
@@ -668,7 +722,7 @@ def convert_utm_api(
         return {"success": True, **result}
     except Exception as e:
         raise HTTPException(400, f"แปลงพิกัดไม่ได้: {e}")
- 
+
 # ── Reload schema cache ───────────────────────────
 @app.post("/reload-schema/", tags=["Admin"])
 async def reload_schema(db: Client = Depends(get_db)):
@@ -678,11 +732,11 @@ async def reload_schema(db: Client = Depends(get_db)):
         return {"success": True, "message": "Reload schema สำเร็จ"}
     except Exception as e:
         return {"success": False, "message": str(e)}
- 
+
 # ─────────────────────────────────────────────────
 # 11. DEBUG ENDPOINTS
 # ─────────────────────────────────────────────────
- 
+
 @app.post("/debug-zip/", tags=["Debug"])
 async def debug_zip(file: UploadFile = File(...)):
     """ตรวจสอบโครงสร้างไฟล์ ZIP + Shapefile โดยละเอียด"""
@@ -691,24 +745,24 @@ async def debug_zip(file: UploadFile = File(...)):
         content = await file.read()
         result["file_size_kb"] = round(len(content) / 1024, 1)
         result["filename"]     = file.filename
- 
+
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = os.path.join(tmp, "upload.zip")
             with open(zip_path, "wb") as f:
                 f.write(content)
- 
+
             with zipfile.ZipFile(zip_path) as z:
                 result["zip_contents"] = z.namelist()
- 
+
             ex_dir = os.path.join(tmp, "ex")
             os.makedirs(ex_dir)
             with zipfile.ZipFile(zip_path) as z:
                 z.extractall(ex_dir)
- 
+
             shp_files  = glob.glob(os.path.join(ex_dir, "**", "*.shp"), recursive=True)
             shp_files += glob.glob(os.path.join(ex_dir, "**", "*.SHP"), recursive=True)
             result["shp_found"] = shp_files
- 
+
             if shp_files:
                 gdf = gpd.read_file(shp_files[0])
                 result["gdf_columns"]      = list(gdf.columns)
@@ -720,15 +774,15 @@ async def debug_zip(file: UploadFile = File(...)):
                 if not gdf.empty:
                     result["first_geom_type"]  = str(type(gdf.iloc[0].geometry).__name__) if gdf.iloc[0].geometry else "None"
                     result["geom_null_count"]  = int(gdf.geometry.isna().sum())
- 
+
         result["success"] = True
     except Exception as e:
         result["success"]   = False
         result["error"]     = str(e)
         result["traceback"] = traceback.format_exc()
     return result
- 
- 
+
+
 @app.post("/debug-multipolygon/", tags=["Debug"])
 async def debug_multipolygon(file: UploadFile = File(...)):
     """
@@ -739,38 +793,38 @@ async def debug_multipolygon(file: UploadFile = File(...)):
     import fiona
     from shapely.geometry import shape
     from shapely.validation import make_valid
- 
+
     result: dict = {}
     try:
         content = await file.read()
         result["file_size_kb"] = round(len(content) / 1024, 1)
         result["filename"]     = file.filename
- 
+
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = os.path.join(tmp, "up.zip")
             with open(zip_path, "wb") as f:
                 f.write(content)
- 
+
             # ── ตรวจ ZIP ──────────────────────────────────────
             with zipfile.ZipFile(zip_path) as z:
                 result["zip_contents"] = z.namelist()
- 
+
             ex = os.path.join(tmp, "ex")
             with zipfile.ZipFile(zip_path) as z:
                 z.extractall(ex)
- 
+
             shps  = glob.glob(os.path.join(ex, "**", "*.shp"), recursive=True)
             shps += glob.glob(os.path.join(ex, "**", "*.SHP"), recursive=True)
             result["shp_found"] = shps
- 
+
             if not shps:
                 result["success"] = False
                 result["error"]   = "ไม่พบไฟล์ .shp ใน ZIP"
                 return result
- 
+
             shp = shps[0]
             result["shp_path"] = shp
- 
+
             # ── ทดสอบ fiona โดยตรง ────────────────────────────
             fiona_result = {}
             try:
@@ -781,26 +835,26 @@ async def debug_multipolygon(file: UploadFile = File(...)):
                     fiona_result["schema"]      = str(src.schema)
                     fiona_result["feature_count"] = len(src)
                     fiona_result["fiona_version"] = fiona.__version__
- 
+
                     if len(src) == 0:
                         fiona_result["warning"] = "ไม่มี feature ในไฟล์"
                     else:
                         feat = next(iter(src))
- 
+
                         # ── keys ที่มีใน feature object ──────────
                         fiona_result["feat_keys"] = list(feat.keys())
- 
+
                         # ── เปรียบเทียบ 2 วิธีเข้าถึง geometry ──
                         # วิธี 1: feat["geometry"]  (fiona 1.9+ preferred)
                         geom_bracket = feat["geometry"] if "geometry" in feat else "KEY_NOT_FOUND"
                         # วิธี 2: feat.geometry  (fiona < 1.9 / legacy)
                         geom_attr    = getattr(feat, "geometry", "ATTR_NOT_FOUND")
- 
+
                         fiona_result["geom_via_bracket_type"]   = type(geom_bracket).__name__
                         fiona_result["geom_via_bracket_is_none"] = geom_bracket is None
                         fiona_result["geom_via_attr_type"]      = type(geom_attr).__name__
                         fiona_result["geom_via_attr_is_none"]   = geom_attr is None
- 
+
                         # preview ค่า geometry dict
                         if geom_bracket and hasattr(geom_bracket, "get"):
                             fiona_result["geom_type_field"]      = geom_bracket.get("type")
@@ -810,7 +864,7 @@ async def debug_multipolygon(file: UploadFile = File(...)):
                                 fiona_result["geom_coord_sample"] = str(coord_sample)[:300]
                         elif isinstance(geom_bracket, str):
                             fiona_result["geom_bracket_str"] = geom_bracket
- 
+
                         # ── ทดสอบ shapely shape() ─────────────────
                         shapely_result = {}
                         raw = geom_bracket if geom_bracket is not None else geom_attr
@@ -831,15 +885,15 @@ async def debug_multipolygon(file: UploadFile = File(...)):
                                 shapely_result["traceback"] = traceback.format_exc()
                         else:
                             shapely_result["error"] = "ไม่ได้ geometry จากทั้ง 2 วิธี"
- 
+
                         fiona_result["shapely_test"] = shapely_result
- 
+
             except Exception as e_fiona:
                 fiona_result["error"]     = str(e_fiona)
                 fiona_result["traceback"] = traceback.format_exc()
- 
+
             result["fiona"] = fiona_result
- 
+
             # ── ทดสอบ geopandas อ่านตรง ──────────────────────
             gpd_result = {}
             try:
@@ -865,9 +919,9 @@ async def debug_multipolygon(file: UploadFile = File(...)):
             except Exception as e_gpd:
                 gpd_result["error"]     = str(e_gpd)
                 gpd_result["traceback"] = traceback.format_exc()
- 
+
             result["geopandas"] = gpd_result
- 
+
             # ── ทดสอบ extract_gis (pipeline จริง) ────────────
             pipeline_result = {}
             try:
@@ -889,18 +943,18 @@ async def debug_multipolygon(file: UploadFile = File(...)):
                 pipeline_result["success"]   = False
                 pipeline_result["error"]     = str(e_pipe)
                 pipeline_result["traceback"] = traceback.format_exc()
- 
+
             result["pipeline"] = pipeline_result
- 
+
         result["success"] = True
- 
+
     except Exception as e:
         result["success"]   = False
         result["error"]     = str(e)
         result["traceback"] = traceback.format_exc()
- 
+
     return result
- 
+
 # ─────────────────────────────────────────────────
 # 12. GLOBAL ERROR HANDLER
 # ─────────────────────────────────────────────────
