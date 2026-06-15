@@ -1,8 +1,9 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
-geopandas==0.14.4
 supabase==2.5.0
-shapely==2.0.4
+geopandas==0.14.4
+shapely==2.0.6
 pyproj==3.6.1
 fiona==1.9.6
+numpy==1.26.4
