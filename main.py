@@ -208,40 +208,34 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     if not shp_files:
         raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
 
-    try:
-        gdf = gpd.read_file(shp_files[0])
-    except Exception as e:
-        raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e}")
+    # ✅ FIX: rename ไฟล์ทุกตัวในโฟลเดอร์เดียวกันให้เป็น ASCII เพื่อหลีกเลี่ยงปัญหา encoding ชื่อไทย
+    original_shp = shp_files[0]
+    shp_dir = os.path.dirname(original_shp)
+    safe_shp = os.path.join(shp_dir, "input.shp")
+    for f in glob.glob(os.path.join(shp_dir, "*")):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx"):
+            try:
+                os.rename(f, os.path.join(shp_dir, f"input{ext}"))
+            except Exception:
+                pass
+    shp_path = safe_shp if os.path.exists(safe_shp) else original_shp
+    log.info(f"[GIS] reading: {shp_path}")
 
-    log.info(f"[GIS] columns={list(gdf.columns)}, crs={gdf.crs}, empty={gdf.empty}")
+    try:
+        gdf = gpd.read_file(shp_path)
+    except Exception as e:
+        try:
+            import fiona
+            with fiona.open(shp_path) as src:
+                gdf = gpd.GeoDataFrame.from_features(src, crs=src.crs)
+        except Exception as e2:
+            raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e} | fiona: {e2}")
+
+    log.info(f"[GIS] columns={list(gdf.columns)}, crs={gdf.crs}, empty={gdf.empty}, geom_col={gdf.geometry.name if len(gdf) >= 0 else 'N/A'}")
 
     if gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูลเชิงพื้นที่")
-
-    # ✅ FIX v2: หา geometry column จริงๆ ไม่ว่าจะชื่ออะไร
-    from shapely.geometry.base import BaseGeometry
-
-    # กรณี active geometry column หายไปจาก columns
-    try:
-        _ = gdf.geometry  # ทดสอบว่า access ได้ไหม
-        has_geom = True
-    except Exception:
-        has_geom = False
-
-    if not has_geom or gdf._geometry_column_name not in gdf.columns:
-        # หา column ที่มี shapely geometry อยู่จริง
-        geom_cols = [c for c in gdf.columns
-                     if gdf[c].dropna().apply(lambda v: isinstance(v, BaseGeometry)).any()]
-        if not geom_cols:
-            # หาจากชื่อ
-            geom_cols = [c for c in gdf.columns if c.lower() in ("geometry", "shape", "geom", "the_geom")]
-        if not geom_cols:
-            raise HTTPException(400, f"Shapefile ไม่มีข้อมูล Geometry — columns ที่พบ: {list(gdf.columns)}")
-        gdf = gdf.set_geometry(geom_cols[0])
-        log.info(f"[GIS] set_geometry({geom_cols[0]})")
-
-    if gdf.geometry.isna().all():
-        raise HTTPException(400, "Shapefile มี geometry column แต่ข้อมูลว่างทั้งหมด")
 
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=32647)
