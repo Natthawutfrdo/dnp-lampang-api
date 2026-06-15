@@ -326,10 +326,20 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
             raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
 
         gdf = gpd.GeoDataFrame(features, geometry="geometry")
+
+        # 🔧 FIX: set_crs ต้องการ pyproj.CRS object ไม่ใช่ str/bytes
+        # pyproj บางเวอร์ชั่นโยน "expected bytes, str found" ถ้าส่ง WKT str ตรงๆ
         if crs_wkt:
-            gdf = gdf.set_crs(crs_wkt, allow_override=True)
-        elif gdf.crs is None:
-            gdf = gdf.set_crs(epsg=32647)
+            try:
+                from pyproj import CRS as ProjCRS
+                crs_obj = ProjCRS.from_wkt(crs_wkt)
+                gdf = gdf.set_crs(crs_obj, allow_override=True)
+                log.info(f"[GIS] CRS set via pyproj: {crs_obj.to_epsg()}")
+            except Exception as crs_err:
+                log.warning(f"[GIS] from_wkt failed ({crs_err}) — ลอง EPSG:32647")
+                gdf = gdf.set_crs(epsg=32647, allow_override=True)
+        else:
+            gdf = gdf.set_crs(epsg=32647, allow_override=True)
             log.info("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
 
     except HTTPException:
