@@ -203,13 +203,12 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     except Exception:
         raise HTTPException(400, "ไฟล์ ZIP ไม่สมบูรณ์หรือเสียหาย")
 
-    shp_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(extract_dir)
-        for f in files if f.endswith(".shp")
-    ]
-    if not shp_files:
-        raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
+   import glob
+shp_files = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
+if not shp_files:
+    shp_files = glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
+if not shp_files:
+    raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
 
     try:
         gdf = gpd.read_file(shp_files[0])
