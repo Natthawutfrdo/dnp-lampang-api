@@ -4,24 +4,24 @@ DNP GIS Case API — Production v4.1
 แก้ไข: CORS, response format, pagination, schema cache, error handling
 🔧 v4.1: แก้ validate_file นามสกุลไฟล์ (เพิ่มจุดนำหน้า ext)
 """
- 
+
 import os, shutil, tempfile, zipfile, json, math, time, logging, glob
 from typing import Optional, List
 from functools import lru_cache
- 
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 import geopandas as gpd
 from supabase import create_client, Client
- 
+
 # ─────────────────────────────────────────────────
 # 1. LOGGING
 # ─────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
- 
+
 # ─────────────────────────────────────────────────
 # 2. APP + MIDDLEWARE
 # ─────────────────────────────────────────────────
@@ -32,7 +32,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
- 
+
 # ── CORS ──────────────────────────────────────────
 ALLOWED_ORIGINS: List[str] = [
     o.strip()
@@ -43,7 +43,7 @@ ALLOWED_ORIGINS: List[str] = [
     if o.strip()
 ]
 log.info(f"✅ CORS origins: {ALLOWED_ORIGINS}")
- 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -52,9 +52,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
- 
+
 app.add_middleware(GZipMiddleware, minimum_size=1000)
- 
+
 # ─────────────────────────────────────────────────
 # 3. SUPABASE CLIENT
 # ─────────────────────────────────────────────────
@@ -62,7 +62,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 MAX_FILE_MB  = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_BYTES    = MAX_FILE_MB * 1024 * 1024
- 
+
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -72,18 +72,18 @@ if SUPABASE_URL and SUPABASE_KEY:
         log.error(f"❌ Supabase init error: {e}")
 else:
     log.warning("⚠️  SUPABASE_URL / SUPABASE_KEY not set")
- 
+
 def get_db() -> Client:
     if not supabase:
         raise HTTPException(503, detail="ฐานข้อมูลยังไม่ได้เชื่อมต่อ")
     return supabase
- 
+
 # ─────────────────────────────────────────────────
 # 4. SCHEMA CACHE
 # ─────────────────────────────────────────────────
 _schema_cache: dict[str, tuple[bool, float]] = {}
 SCHEMA_TTL = 300  # 5 นาที
- 
+
 def check_columns(table: str, columns: list[str]) -> bool:
     key = f"{table}:{','.join(sorted(columns))}"
     now = time.time()
@@ -100,10 +100,10 @@ def check_columns(table: str, columns: list[str]) -> bool:
     except Exception:
         _schema_cache[key] = (False, now)
         return False
- 
+
 def clear_schema_cache():
     _schema_cache.clear()
- 
+
 # ─────────────────────────────────────────────────
 # 5. TABLE MAP
 # ─────────────────────────────────────────────────
@@ -112,12 +112,12 @@ TABLE_MAP = {
     "timber":       "timber_cases",
     "wildlife":     "wildlife_cases",
 }
- 
+
 def get_table(case_type: str) -> str:
     if case_type not in TABLE_MAP:
         raise HTTPException(400, f"case_type ต้องเป็น: {', '.join(TABLE_MAP.keys())}")
     return TABLE_MAP[case_type]
- 
+
 # ─────────────────────────────────────────────────
 # 6. FILE VALIDATION  🔧 แก้ Bug 1: normalize ext ให้มีจุดเสมอ
 # ─────────────────────────────────────────────────
@@ -135,7 +135,7 @@ async def validate_file(
         raise HTTPException(413, f"ไฟล์ใหญ่เกิน {max_bytes // 1024 // 1024} MB")
     await file.seek(0)
     return content
- 
+
 # ─────────────────────────────────────────────────
 # 7. UTM / LAT-LON HELPERS
 # ─────────────────────────────────────────────────
@@ -163,7 +163,7 @@ def utm_to_latlon(zone: int, easting: float, northing: float, is_north: bool = T
     lon = (D - (1+2*T1+C1)*D**3/6
            + (5-2*C1+28*T1-3*C1**2+8*e1sq+24*T1**2)*D**5/120)/math.cos(phi1)
     return {"lat": math.degrees(lat), "lon": lon0 + math.degrees(lon)}
- 
+
 def latlon_to_utm(lat: float, lon: float) -> dict:
     """แปลง Lat/Lon → UTM (WGS84)"""
     try:
@@ -190,7 +190,7 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
     except Exception as err:
         log.warning(f"latlon→UTM error: {err}")
         return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
- 
+
 # ─────────────────────────────────────────────────
 # 8. GIS EXTRACTION
 # ─────────────────────────────────────────────────
@@ -201,28 +201,52 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
             z.extractall(extract_dir)
     except Exception:
         raise HTTPException(400, "ไฟล์ ZIP ไม่สมบูรณ์หรือเสียหาย")
- 
+
     shp_files = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
     if not shp_files:
         shp_files = glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
     if not shp_files:
         raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
- 
+
     try:
         gdf = gpd.read_file(shp_files[0])
     except Exception as e:
         raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e}")
- 
+
+    log.info(f"[GIS] columns={list(gdf.columns)}, crs={gdf.crs}, empty={gdf.empty}")
+
     if gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูลเชิงพื้นที่")
- 
-    # ✅ FIX: ตรวจว่ามี geometry column ก่อนกำหนด CRS
-    if "geometry" not in gdf.columns or gdf.geometry.isna().all():
-        raise HTTPException(400, "Shapefile ไม่มีข้อมูล Geometry — กรุณาตรวจสอบไฟล์ .shp และ .prj")
- 
+
+    # ✅ FIX v2: หา geometry column จริงๆ ไม่ว่าจะชื่ออะไร
+    from shapely.geometry.base import BaseGeometry
+
+    # กรณี active geometry column หายไปจาก columns
+    try:
+        _ = gdf.geometry  # ทดสอบว่า access ได้ไหม
+        has_geom = True
+    except Exception:
+        has_geom = False
+
+    if not has_geom or gdf._geometry_column_name not in gdf.columns:
+        # หา column ที่มี shapely geometry อยู่จริง
+        geom_cols = [c for c in gdf.columns
+                     if gdf[c].dropna().apply(lambda v: isinstance(v, BaseGeometry)).any()]
+        if not geom_cols:
+            # หาจากชื่อ
+            geom_cols = [c for c in gdf.columns if c.lower() in ("geometry", "shape", "geom", "the_geom")]
+        if not geom_cols:
+            raise HTTPException(400, f"Shapefile ไม่มีข้อมูล Geometry — columns ที่พบ: {list(gdf.columns)}")
+        gdf = gdf.set_geometry(geom_cols[0])
+        log.info(f"[GIS] set_geometry({geom_cols[0]})")
+
+    if gdf.geometry.isna().all():
+        raise HTTPException(400, "Shapefile มี geometry column แต่ข้อมูลว่างทั้งหมด")
+
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=32647)
- 
+        log.info("[GIS] CRS ไม่พบ — ใช้ EPSG:32647 (UTM 47N)")
+
     try:
         gdf84 = gdf.to_crs(epsg=4326)
         c = gdf84.geometry.centroid.iloc[0]
@@ -230,22 +254,22 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     except Exception:
         lat, lon = 18.29, 99.50
         gdf84 = gdf
- 
+
     try:
         area_sqm = max(float(gdf.to_crs(epsg=32647).geometry.area.sum()), 0.0)
     except Exception:
         area_sqm = 0.0
- 
+
     total_wa = area_sqm / 4.0
     rai   = int(total_wa // 400)
     ngarn = int((total_wa % 400) // 100)
     wa    = int(round(total_wa % 100))
- 
+
     try:
         gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
         pass
- 
+
     utm = latlon_to_utm(lat, lon)
     return {
         "gdf84": gdf84,
@@ -253,7 +277,7 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
         "rai": rai, "ngarn": ngarn, "wa": wa,
         **utm,
     }
- 
+
 # ─────────────────────────────────────────────────
 # 9. STORAGE UPLOAD HELPER
 # ─────────────────────────────────────────────────
@@ -265,15 +289,15 @@ def upload_to_storage(db: Client, bucket: str, path: str, file_path: str, conten
             file_options={"cache-control": "3600", "upsert": True, "content-type": content_type},
         )
     return db.storage.from_(bucket).get_public_url(path)
- 
+
 # ─────────────────────────────────────────────────
 # 10. ENDPOINTS
 # ─────────────────────────────────────────────────
- 
+
 @app.get("/", tags=["Health"])
 def root():
     return {"message": "DNP GIS Case API v4.1 is running!", "status": "ok", "version": "4.1"}
- 
+
 @app.get("/health", tags=["Health"])
 def health():
     return {
@@ -281,16 +305,16 @@ def health():
         "db": "connected" if supabase else "disconnected",
         "cors_origins": ALLOWED_ORIGINS,
     }
- 
+
 # ── วิเคราะห์ Shapefile (ไม่บันทึก DB) ──────────
 @app.post("/analyze-shapefile/", tags=["GIS"])
 async def analyze_shapefile(file: UploadFile = File(...)):
     # 🔧 ส่ง "zip" (ไม่มีจุด) — validate_file จะเติมจุดให้เอง
-    await validate_file(file, "zip")
+    content = await validate_file(file, "zip")  # อ่านและ seek(0) แล้ว
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "upload.zip")
         with open(zip_path, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
+            buf.write(content)  # ใช้ content ที่อ่านไว้แล้ว ไม่ต้องอ่านซ้ำ
         gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
     return {
         "success": True,
@@ -300,7 +324,7 @@ async def analyze_shapefile(file: UploadFile = File(...)):
         "utm_easting": gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
     }
- 
+
 # ── บันทึกคดีบุกรุก / ไม้ ───────────────────────
 @app.post("/process-shapefile/", tags=["Cases"])
 async def process_shapefile(
@@ -332,24 +356,24 @@ async def process_shapefile(
 ):
     get_table(case_type)
     # 🔧 ส่ง "zip" และ "pdf" — validate_file เติมจุดให้เอง
-    await validate_file(file, "zip")
+    zip_content = await validate_file(file, "zip")  # อ่านครั้งเดียว ใช้ content แทน
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
- 
+
     primary_key = complaint_no or criminal_no or "unknown"
     safe_key = primary_key.replace("/", "_").replace(" ", "_")
- 
+
     new_cols = (case_type == "encroachment") and check_columns(
         "encroachment_cases", ["complaint_no", "criminal_no", "seizure_no"]
     )
- 
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = os.path.join(tmp, "upload.zip")
             with open(zip_path, "wb") as buf:
-                shutil.copyfileobj(file.file, buf)
+                buf.write(zip_content)
             gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
- 
+
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
             f_northing = utm_northing if utm_northing != 0 else gis["utm_northing"]
@@ -357,13 +381,13 @@ async def process_shapefile(
             f_ngarn = int(ngarn)     if ngarn > 0 else gis["ngarn"]
             f_wa    = int(round(wa)) if wa    > 0 else gis["wa"]
             coords  = [gis["lat"], gis["lon"]]
- 
+
             clean_shp = f"{safe_key}_{file.filename.replace(' ', '_')}"
             try:
                 shp_url = upload_to_storage(db, "dnp-shapefiles", clean_shp, zip_path)
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"อัปโหลด Shapefile ล้มเหลว: {e}"})
- 
+
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 pdf_fn = f"{safe_key}_{pdf_file.filename.replace(' ', '_')}"
@@ -374,7 +398,7 @@ async def process_shapefile(
                     pdf_url = upload_to_storage(db, "dnp-pdfs", pdf_fn, pdf_tmp, "application/pdf")
                 except Exception as e:
                     log.warning(f"PDF upload failed: {e}")
- 
+
             geojson_fn   = f"{safe_key}_map.json"
             geojson_path = os.path.join(tmp, geojson_fn)
             with open(geojson_path, "w", encoding="utf-8") as jf:
@@ -383,9 +407,9 @@ async def process_shapefile(
                 geojson_url = upload_to_storage(db, "dnp-shapefiles", geojson_fn, geojson_path, "application/json")
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"สร้าง GeoJSON ล้มเหลว: {e}"})
- 
+
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
- 
+
             try:
                 if case_type == "encroachment":
                     row: dict = {
@@ -418,7 +442,7 @@ async def process_shapefile(
                         if seizure_no:   extra += f"\n[ยึดทรัพย์: {seizure_no}]"
                         if extra: row["case_status"] = case_status + extra
                     db.table("encroachment_cases").insert(row).execute()
- 
+
                 elif case_type == "timber":
                     db.table("timber_cases").insert({
                         "case_no":        complaint_no or criminal_no,
@@ -442,10 +466,10 @@ async def process_shapefile(
                         "utm_easting":    f_easting,
                         "utm_northing":   f_northing,
                     }).execute()
- 
+
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"บันทึก DB ล้มเหลว: {e}"})
- 
+
             return {
                 "success":         True,
                 "message":         "บันทึกข้อมูลสำเร็จ",
@@ -458,13 +482,13 @@ async def process_shapefile(
                 "utm_northing":    f_northing,
                 "schema_upgraded": new_cols,
             }
- 
+
     except HTTPException:
         raise
     except Exception as e:
         log.exception("process_shapefile error")
         return JSONResponse({"success": False, "error": str(e)})
- 
+
 # ── บันทึกคดีสัตว์ป่า ───────────────────────────
 @app.post("/process-wildlife/", tags=["Cases"])
 async def process_wildlife(
@@ -498,10 +522,10 @@ async def process_wildlife(
                 pdf_url = upload_to_storage(db, "dnp-pdfs", pdf_fn, pdf_path, "application/pdf")
         except Exception as e:
             log.warning(f"Wildlife PDF upload failed: {e}")
- 
+
     is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
     coords = [coords_lat, coords_lon] if (coords_lat or coords_lon) else [18.29, 99.50]
- 
+
     f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
     if utm_easting == 0 and coords_lat:
         u = latlon_to_utm(coords[0], coords[1])
@@ -512,7 +536,7 @@ async def process_wildlife(
             coords = [ll["lat"], ll["lon"]]
         except Exception:
             coords = [18.29, 99.50]
- 
+
     try:
         db.table("wildlife_cases").insert({
             "case_no":        case_no,
@@ -538,7 +562,7 @@ async def process_wildlife(
         }
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
- 
+
 # ── ดึงรายการคดี ─────────────────────────────────
 @app.get("/get-cases/{case_type}", tags=["Cases"])
 async def get_cases(
@@ -566,7 +590,7 @@ async def get_cases(
         }
     except Exception as e:
         raise HTTPException(500, str(e))
- 
+
 # ── ลบคดี ────────────────────────────────────────
 @app.delete("/delete-case/{case_type}/{case_no}", tags=["Cases"])
 async def delete_case(
@@ -580,7 +604,7 @@ async def delete_case(
         return {"success": True, "message": f"ลบคดี {case_no} เรียบร้อย"}
     except Exception as e:
         raise HTTPException(500, str(e))
- 
+
 # ── UTM Converter endpoint ────────────────────────
 @app.get("/convert-utm", tags=["Utils"])
 def convert_utm_api(
@@ -594,7 +618,7 @@ def convert_utm_api(
         return {"success": True, **result}
     except Exception as e:
         raise HTTPException(400, f"แปลงพิกัดไม่ได้: {e}")
- 
+
 # ── Reload schema cache ───────────────────────────
 @app.post("/reload-schema/", tags=["Admin"])
 async def reload_schema(db: Client = Depends(get_db)):
@@ -604,7 +628,7 @@ async def reload_schema(db: Client = Depends(get_db)):
         return {"success": True, "message": "Reload schema สำเร็จ"}
     except Exception as e:
         return {"success": False, "message": str(e)}
- 
+
 # ─────────────────────────────────────────────────
 # 11. GLOBAL ERROR HANDLER
 # ─────────────────────────────────────────────────
@@ -612,3 +636,51 @@ async def reload_schema(db: Client = Depends(get_db)):
 async def global_exception_handler(request, exc):
     log.exception(f"Unhandled error: {exc}")
     return JSONResponse(status_code=500, content={"success": False, "error": "Internal server error"})
+
+# ── DEBUG endpoint (ลบออกหลัง debug เสร็จ) ────────
+@app.post("/debug-zip/", tags=["Debug"])
+async def debug_zip(file: UploadFile = File(...)):
+    """ตรวจสอบโครงสร้างไฟล์ ZIP + Shapefile โดยละเอียด"""
+    import traceback
+    result = {}
+    try:
+        content = await file.read()
+        result["file_size_kb"] = round(len(content) / 1024, 1)
+        result["filename"] = file.filename
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "upload.zip")
+            with open(zip_path, "wb") as f:
+                f.write(content)
+
+            # ตรวจ ZIP contents
+            with zipfile.ZipFile(zip_path) as z:
+                result["zip_contents"] = z.namelist()
+
+            ex_dir = os.path.join(tmp, "ex")
+            os.makedirs(ex_dir)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(ex_dir)
+
+            shp_files = glob.glob(os.path.join(ex_dir, "**", "*.shp"), recursive=True)
+            shp_files += glob.glob(os.path.join(ex_dir, "**", "*.SHP"), recursive=True)
+            result["shp_found"] = shp_files
+
+            if shp_files:
+                gdf = gpd.read_file(shp_files[0])
+                result["gdf_columns"] = list(gdf.columns)
+                result["gdf_dtypes"] = {c: str(gdf[c].dtype) for c in gdf.columns}
+                result["gdf_crs"] = str(gdf.crs)
+                result["gdf_empty"] = gdf.empty
+                result["gdf_len"] = len(gdf)
+                result["geometry_col"] = gdf.geometry.name if not gdf.empty else "N/A"
+                if not gdf.empty:
+                    result["first_geom_type"] = str(type(gdf.iloc[0].geometry).__name__) if gdf.iloc[0].geometry else "None"
+                    result["geom_null_count"] = int(gdf.geometry.isna().sum())
+
+        result["success"] = True
+    except Exception as e:
+        result["success"] = False
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()
+    return result
