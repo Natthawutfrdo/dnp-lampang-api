@@ -208,29 +208,29 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     if not shp_files:
         raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
 
-    # ✅ FIX: rename ไฟล์ทุกตัวในโฟลเดอร์เดียวกันให้เป็น ASCII เพื่อหลีกเลี่ยงปัญหา encoding ชื่อไทย
+    # ✅ FIX v3: copy ไฟล์ทั้งหมดไปไว้ใน safe_dir ที่ชื่อ ASCII ล้วน
     original_shp = shp_files[0]
     shp_dir = os.path.dirname(original_shp)
-    safe_shp = os.path.join(shp_dir, "input.shp")
+    safe_dir = os.path.join(extract_dir, "safe")
+    os.makedirs(safe_dir, exist_ok=True)
     for f in glob.glob(os.path.join(shp_dir, "*")):
         ext = os.path.splitext(f)[1].lower()
         if ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx"):
             try:
-                os.rename(f, os.path.join(shp_dir, f"input{ext}"))
+                shutil.copy2(f, os.path.join(safe_dir, f"input{ext}"))
             except Exception:
                 pass
-    shp_path = safe_shp if os.path.exists(safe_shp) else original_shp
+    shp_path = os.path.join(safe_dir, "input.shp")
+    if not os.path.exists(shp_path):
+        shp_path = original_shp
     log.info(f"[GIS] reading: {shp_path}")
 
     try:
         gdf = gpd.read_file(shp_path)
+        log.info(f"[GIS] read ok: rows={len(gdf)}, cols={list(gdf.columns)}, crs={gdf.crs}, geom_col={gdf.geometry.name if hasattr(gdf, '_geometry_column_name') else 'NONE'}, dtypes={dict(gdf.dtypes)}")
     except Exception as e:
-        try:
-            import fiona
-            with fiona.open(shp_path) as src:
-                gdf = gpd.GeoDataFrame.from_features(src, crs=src.crs)
-        except Exception as e2:
-            raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e} | fiona: {e2}")
+        log.error(f"[GIS] read_file failed: {e}")
+        raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e}")
 
     log.info(f"[GIS] columns={list(gdf.columns)}, crs={gdf.crs}, empty={gdf.empty}, geom_col={gdf.geometry.name if len(gdf) >= 0 else 'N/A'}")
 
