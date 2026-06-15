@@ -225,21 +225,40 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
         shp_path = original_shp
     log.info(f"[GIS] reading: {shp_path}")
 
+    # ✅ FIX FINAL: ใช้ fiona อ่านตรงๆ แล้วสร้าง GeoDataFrame เอง
+    # หลีกเลี่ยงปัญหา geopandas ไม่ set geometry column อัตโนมัติ
     try:
-        gdf = gpd.read_file(shp_path)
-        log.info(f"[GIS] read ok: rows={len(gdf)}, cols={list(gdf.columns)}, crs={gdf.crs}, geom_col={gdf.geometry.name if hasattr(gdf, '_geometry_column_name') else 'NONE'}, dtypes={dict(gdf.dtypes)}")
+        import fiona
+        from shapely.geometry import shape
+
+        with fiona.open(shp_path, encoding='utf-8') as src:
+            crs_wkt = src.crs_wkt
+            features = []
+            for feat in src:
+                geom = shape(feat.geometry) if feat.geometry else None
+                props = dict(feat.properties)
+                features.append({"geometry": geom, **props})
+            log.info(f"[GIS] fiona ok: {len(features)} features, crs={src.crs}")
+
+        if not features:
+            raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
+
+        from shapely.geometry import shape
+        gdf = gpd.GeoDataFrame(features, geometry="geometry")
+        if crs_wkt:
+            gdf = gdf.set_crs(crs_wkt)
+        elif gdf.crs is None:
+            gdf = gdf.set_crs(epsg=32647)
+            log.info("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
+
+    except HTTPException:
+        raise
     except Exception as e:
-        log.error(f"[GIS] read_file failed: {e}")
+        log.error(f"[GIS] fiona failed: {e}")
         raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {e}")
 
-    log.info(f"[GIS] columns={list(gdf.columns)}, crs={gdf.crs}, empty={gdf.empty}, geom_col={gdf.geometry.name if len(gdf) >= 0 else 'N/A'}")
-
-    if gdf.empty:
-        raise HTTPException(400, "Shapefile ไม่มีข้อมูลเชิงพื้นที่")
-
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=32647)
-        log.info("[GIS] CRS ไม่พบ — ใช้ EPSG:32647 (UTM 47N)")
+    if gdf.geometry.isna().all():
+        raise HTTPException(400, "Shapefile มีข้อมูลแต่ geometry ว่างทั้งหมด")
 
     try:
         gdf84 = gdf.to_crs(epsg=4326)
