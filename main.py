@@ -284,24 +284,37 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
                 geom = None
                 if raw_geom is not None:
                     try:
-                        # shape() รับ dict หรือ __geo_interface__ ได้เลย
-                        geom = shape(raw_geom)
-                        if not geom.is_valid:
-                            geom = make_valid(geom)
-                    except TypeError as te:
-                        # 🔧 FIX 3: "expected bytes, str found" — raw_geom เป็น str แทน dict
-                        # เกิดจาก fiona บางเวอร์ชั่นส่ง WKT string แทน GeoJSON dict
-                        log.warning(f"[GIS] shape(dict) TypeError: {te} — ลอง WKT")
-                        try:
+                        # ── ตรวจ type ก่อน — ไม่รอให้ shape() โยน error ──────
+                        if isinstance(raw_geom, str):
+                            # fiona บางเวอร์ชั่นส่ง WKT string โดยตรง
+                            log.info("[GIS] geometry เป็น str → ใช้ wkt.loads()")
                             from shapely import wkt as swkt
-                            geom = swkt.loads(str(raw_geom))
-                            if not geom.is_valid:
-                                geom = make_valid(geom)
-                        except Exception as wkt_e:
-                            log.warning(f"[GIS] WKT fallback failed: {wkt_e}")
-                            geom = None
+                            geom = swkt.loads(raw_geom)
+
+                        elif isinstance(raw_geom, bytes):
+                            # WKB bytes
+                            log.info("[GIS] geometry เป็น bytes → ใช้ wkb.loads()")
+                            from shapely import wkb as swkb
+                            geom = swkb.loads(raw_geom)
+
+                        elif hasattr(raw_geom, "__geo_interface__"):
+                            geom = shape(raw_geom.__geo_interface__)
+
+                        elif isinstance(raw_geom, dict):
+                            # GeoJSON dict — วิธีปกติของ fiona 1.9+
+                            geom = shape(raw_geom)
+
+                        else:
+                            # fallback
+                            log.warning(f"[GIS] geometry type ไม่คาดคิด: {type(raw_geom)} — ลอง shape() ตรงๆ")
+                            geom = shape(raw_geom)
+
+                        # ซ่อม geometry ที่ invalid
+                        if geom is not None and not geom.is_valid:
+                            geom = make_valid(geom)
+
                     except Exception as eg:
-                        log.warning(f"[GIS] shape() error: {eg}")
+                        log.warning(f"[GIS] parse geometry error ({type(raw_geom).__name__}): {eg}")
                         geom = None
 
                 props = dict(feat.properties) if hasattr(feat, "properties") else {}
