@@ -1,7 +1,8 @@
 """
-DNP GIS Case API — Production v4.0
+DNP GIS Case API — Production v4.1
 ระบบ API สารบบคดีเชิงพื้นที่ สบอ.13 ลำปาง
 แก้ไข: CORS, response format, pagination, schema cache, error handling
+🔧 v4.1: แก้ validate_file นามสกุลไฟล์ (เพิ่มจุดนำหน้า ext)
 """
 
 import os, shutil, tempfile, zipfile, json, math, time, logging, glob
@@ -27,14 +28,12 @@ log = logging.getLogger(__name__)
 app = FastAPI(
     title="DNP GIS Case API",
     description="ระบบบริการข้อมูลสารบบคดีและแผนที่เชิงพื้นที่ สบอ.13 ลำปาง",
-    version="4.0",
+    version="4.1",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
 # ── CORS ──────────────────────────────────────────
-# VALUE ใน Render ต้องเป็น: https://natthawutfrdo.github.io,http://localhost:3000
-# ไม่ต้องใส่ ALLOWED_ORIGINS= นำหน้า
 ALLOWED_ORIGINS: List[str] = [
     o.strip()
     for o in os.environ.get(
@@ -54,7 +53,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# ── GZip ─────────────────────────────────────────
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ─────────────────────────────────────────────────
@@ -76,13 +74,12 @@ else:
     log.warning("⚠️  SUPABASE_URL / SUPABASE_KEY not set")
 
 def get_db() -> Client:
-    """Dependency: ตรวจสอบ Supabase ก่อนใช้งาน"""
     if not supabase:
         raise HTTPException(503, detail="ฐานข้อมูลยังไม่ได้เชื่อมต่อ")
     return supabase
 
 # ─────────────────────────────────────────────────
-# 4. SCHEMA CACHE (ตรวจคอลัมน์ใหม่)
+# 4. SCHEMA CACHE
 # ─────────────────────────────────────────────────
 _schema_cache: dict[str, tuple[bool, float]] = {}
 SCHEMA_TTL = 300  # 5 นาที
@@ -122,15 +119,17 @@ def get_table(case_type: str) -> str:
     return TABLE_MAP[case_type]
 
 # ─────────────────────────────────────────────────
-# 6. FILE VALIDATION
+# 6. FILE VALIDATION  🔧 แก้ Bug 1: normalize ext ให้มีจุดเสมอ
 # ─────────────────────────────────────────────────
 async def validate_file(
     file: UploadFile,
     allowed_ext: str,
     max_bytes: int = MAX_BYTES,
 ) -> bytes:
-    if not file.filename.lower().endswith(allowed_ext):
-        raise HTTPException(400, f"ไฟล์ต้องเป็นนามสกุล .{allowed_ext}")
+    # 🔧 FIX: ทำให้ ext มีจุดนำหน้าเสมอ ไม่ว่าจะส่งมาว่า "zip" หรือ ".zip"
+    ext = allowed_ext if allowed_ext.startswith(".") else f".{allowed_ext}"
+    if not file.filename.lower().endswith(ext):
+        raise HTTPException(400, f"ไฟล์ต้องเป็นนามสกุล {ext}")
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(413, f"ไฟล์ใหญ่เกิน {max_bytes // 1024 // 1024} MB")
@@ -217,11 +216,9 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     if gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูลเชิงพื้นที่")
 
-    # ตั้ง CRS ถ้าไม่มี
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=32647)
 
-    # แปลงเป็น WGS84
     try:
         gdf84 = gdf.to_crs(epsg=4326)
         c = gdf84.geometry.centroid.iloc[0]
@@ -230,7 +227,6 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
         lat, lon = 18.29, 99.50
         gdf84 = gdf
 
-    # คำนวณพื้นที่ (ตร.ม. → ไร่-งาน-ตร.ว.)
     try:
         area_sqm = max(float(gdf.to_crs(epsg=32647).geometry.area.sum()), 0.0)
     except Exception:
@@ -241,7 +237,6 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     ngarn = int((total_wa % 400) // 100)
     wa    = int(round(total_wa % 100))
 
-    # ลด complexity ของ geometry
     try:
         gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
@@ -273,7 +268,7 @@ def upload_to_storage(db: Client, bucket: str, path: str, file_path: str, conten
 
 @app.get("/", tags=["Health"])
 def root():
-    return {"message": "DNP GIS Case API v4.0 is running!", "status": "ok", "version": "4.0"}
+    return {"message": "DNP GIS Case API v4.1 is running!", "status": "ok", "version": "4.1"}
 
 @app.get("/health", tags=["Health"])
 def health():
@@ -286,7 +281,8 @@ def health():
 # ── วิเคราะห์ Shapefile (ไม่บันทึก DB) ──────────
 @app.post("/analyze-shapefile/", tags=["GIS"])
 async def analyze_shapefile(file: UploadFile = File(...)):
-    await validate_file(file, ".zip")
+    # 🔧 ส่ง "zip" (ไม่มีจุด) — validate_file จะเติมจุดให้เอง
+    await validate_file(file, "zip")
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "upload.zip")
         with open(zip_path, "wb") as buf:
@@ -330,29 +326,26 @@ async def process_shapefile(
     utm_northing:   int   = Form(0),
     db: Client = Depends(get_db),
 ):
-    # ── Validate ──
-    get_table(case_type)  # ตรวจ case_type
-    await validate_file(file, ".zip")
+    get_table(case_type)
+    # 🔧 ส่ง "zip" และ "pdf" — validate_file เติมจุดให้เอง
+    await validate_file(file, "zip")
     if pdf_file and pdf_file.filename:
-        await validate_file(pdf_file, ".pdf", max_bytes=20 * 1024 * 1024)
+        await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
 
     primary_key = complaint_no or criminal_no or "unknown"
     safe_key = primary_key.replace("/", "_").replace(" ", "_")
 
-    # ── ตรวจ schema คอลัมน์ใหม่ ──
     new_cols = (case_type == "encroachment") and check_columns(
         "encroachment_cases", ["complaint_no", "criminal_no", "seizure_no"]
     )
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # ── 1. Extract GIS ──
             zip_path = os.path.join(tmp, "upload.zip")
             with open(zip_path, "wb") as buf:
                 shutil.copyfileobj(file.file, buf)
             gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
 
-            # ── 2. ลำดับความสำคัญของค่า (Form > GIS) ──
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
             f_northing = utm_northing if utm_northing != 0 else gis["utm_northing"]
@@ -361,14 +354,12 @@ async def process_shapefile(
             f_wa    = int(round(wa)) if wa    > 0 else gis["wa"]
             coords  = [gis["lat"], gis["lon"]]
 
-            # ── 3. อัปโหลด Shapefile ZIP ──
             clean_shp = f"{safe_key}_{file.filename.replace(' ', '_')}"
             try:
                 shp_url = upload_to_storage(db, "dnp-shapefiles", clean_shp, zip_path)
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"อัปโหลด Shapefile ล้มเหลว: {e}"})
 
-            # ── 4. อัปโหลด PDF ──
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 pdf_fn = f"{safe_key}_{pdf_file.filename.replace(' ', '_')}"
@@ -380,7 +371,6 @@ async def process_shapefile(
                 except Exception as e:
                     log.warning(f"PDF upload failed: {e}")
 
-            # ── 5. สร้างและอัปโหลด GeoJSON ──
             geojson_fn   = f"{safe_key}_map.json"
             geojson_path = os.path.join(tmp, geojson_fn)
             with open(geojson_path, "w", encoding="utf-8") as jf:
@@ -392,7 +382,6 @@ async def process_shapefile(
 
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
 
-            # ── 6. บันทึก DB ──
             try:
                 if case_type == "encroachment":
                     row: dict = {
@@ -419,7 +408,6 @@ async def process_shapefile(
                         row["criminal_no"]  = criminal_no
                         row["seizure_no"]   = seizure_no
                     else:
-                        # Fallback: ยุบเลขคดีไว้ใน case_status
                         extra = ""
                         if complaint_no: extra += f"\n[แจ้ง: {complaint_no}]"
                         if criminal_no:  extra += f"\n[อาญา: {criminal_no}]"
@@ -493,10 +481,10 @@ async def process_wildlife(
     utm_northing:   int   = Form(0),
     db: Client = Depends(get_db),
 ):
-    # ── PDF ──
     pdf_url = ""
     if pdf_file and pdf_file.filename:
-        await validate_file(pdf_file, ".pdf", max_bytes=20 * 1024 * 1024)
+        # 🔧 ส่ง "pdf" — validate_file เติมจุดให้เอง
+        await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pdf_fn   = f"{case_no.replace('/', '_')}_{pdf_file.filename.replace(' ', '_')}"
@@ -510,7 +498,6 @@ async def process_wildlife(
     is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
     coords = [coords_lat, coords_lon] if (coords_lat or coords_lon) else [18.29, 99.50]
 
-    # ── แปลงพิกัดไขว้ ──
     f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
     if utm_easting == 0 and coords_lat:
         u = latlon_to_utm(coords[0], coords[1])
@@ -548,7 +535,7 @@ async def process_wildlife(
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── ดึงรายการคดี (แก้ response format) ──────────
+# ── ดึงรายการคดี ─────────────────────────────────
 @app.get("/get-cases/{case_type}", tags=["Cases"])
 async def get_cases(
     case_type: str,
@@ -567,8 +554,6 @@ async def get_cases(
         if search:
             q = q.ilike("location", f"%{search}%")
         res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-
-        # ── ✅ FIX: คืน {data, total, page, limit} เสมอ ──
         return {
             "data":  res.data  if res.data  else [],
             "total": res.count if res.count else 0,
