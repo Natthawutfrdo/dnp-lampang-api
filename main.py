@@ -4,7 +4,7 @@ DNP GIS Case API — Production v4.0
 แก้ไข: CORS, response format, pagination, schema cache, error handling
 """
 
-import os, shutil, tempfile, zipfile, json, math, time, logging
+import os, shutil, tempfile, zipfile, json, math, time, logging, glob
 from typing import Optional, List
 from functools import lru_cache
 
@@ -203,12 +203,11 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     except Exception:
         raise HTTPException(400, "ไฟล์ ZIP ไม่สมบูรณ์หรือเสียหาย")
 
-   import glob
-shp_files = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
-if not shp_files:
-    shp_files = glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
-if not shp_files:
-    raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
+    shp_files = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
+    if not shp_files:
+        shp_files = glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
+    if not shp_files:
+        raise HTTPException(400, "ไม่พบไฟล์ .shp ในไฟล์ ZIP")
 
     try:
         gdf = gpd.read_file(shp_files[0])
