@@ -259,6 +259,7 @@ def _read_shp_via_fiona(shp_path: str):
     from shapely.geometry import shape
     from shapely.validation import make_valid
     from pyproj import CRS as ProjCRS
+    import re
 
     _ENCODINGS = ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]
     src = None
@@ -277,7 +278,7 @@ def _read_shp_via_fiona(shp_path: str):
             break
 
     if src is None:
-        raise HTTPException(400, "อ่าน .dbf ไม่ได้ — ลอง encoding ทุกแบบแล้ว")
+        raise HTTPException(400, "อ่านไฟล์ไม่ได้ — ไฟล์อาจชำรุด หรือไม่มีโครงสร้างที่ถูกต้อง")
 
     rows = []
     crs_wkt = None
@@ -330,11 +331,11 @@ def _read_shp_via_fiona(shp_path: str):
         for enc in ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]:
             try:
                 _tmp = gpd.read_file(shp_path, encoding=enc)
-                if _tmp is not None and len(_tmp) > 0 and not _tmp.geometry.isna().all():
+                if _tmp is not None and len(_tmp) > 0 and hasattr(_tmp, "geometry") and not _tmp.geometry.isna().all():
                     return _tmp
             except Exception as eg:
                 log.warning(f"[GIS][fiona→gpd] enc={enc} failed: {eg}")
-        raise HTTPException(400, "Shapefile อ่าน geometry ไม่ได้")
+        raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry) หรือไฟล์ชำรุด")
 
     rows = [r for r in rows if r.get("geometry") is not None]
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
@@ -373,6 +374,7 @@ def _read_shp_via_fiona(shp_path: str):
 
 def extract_gis_from_shp(shp_path: str) -> dict:
     from shapely.validation import make_valid
+    import geopandas as gpd
 
     log.info(f"[GIS] reading shp: {shp_path}")
     gdf = None
@@ -381,40 +383,54 @@ def extract_gis_from_shp(shp_path: str) -> dict:
     for enc in ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]:
         try:
             _tmp = gpd.read_file(shp_path, encoding=enc)
-            if (
-                _tmp is not None
-                and len(_tmp) > 0
-                and not _tmp.geometry.isna().all()
-            ):
-                gdf = _tmp
-                log.info(f"[GIS] gpd.read_file ok: encoding={enc}, rows={len(gdf)}")
-                break
-            else:
-                log.warning(f"[GIS] gpd.read_file({enc}): geometry all-null or empty")
-        except UnicodeDecodeError as e:
-            last_err = e
+            if _tmp is not None and len(_tmp) > 0:
+                # บังคับ Set Geometry กรณีที่มีคอลัมน์ geometry แต่อาจหลุดการเชื่อมต่อ
+                if "geometry" in _tmp.columns and getattr(_tmp, "_geometry_column_name", None) is None:
+                    _tmp = _tmp.set_geometry("geometry")
+
+                # เช็คให้ชัวร์ว่ามี Property geometry และไม่เป็น Null ทั้งหมด
+                if hasattr(_tmp, "geometry") and not _tmp.geometry.isna().all():
+                    gdf = _tmp
+                    log.info(f"[GIS] gpd.read_file ok: encoding={enc}, rows={len(gdf)}")
+                    break
+                else:
+                    log.warning(f"[GIS] gpd.read_file({enc}): geometry all-null or empty")
         except Exception as e:
             last_err = e
             log.warning(f"[GIS] gpd.read_file({enc}) error: {e}")
             gdf = None
 
-    if gdf is None or gdf.empty or gdf.geometry.isna().all():
+    # ถ้า gpd อ่านไม่ได้ หรืออ่านได้แต่ไม่มี Geometry ให้ลองใช้ fiona
+    if gdf is None or gdf.empty or not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
         log.warning("[GIS] gpd fallback → fiona manual read")
         try:
             gdf = _read_shp_via_fiona(shp_path)
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {last_err or e}")
+            err_msg = str(last_err) if last_err else str(e)
+            # ดักจับ Error ที่เกิดจากการพยายามโยน CRS ใส่ DataFrame ที่ไม่มี Geometry
+            if "without a geometry column" in err_msg:
+                raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry ว่างเปล่า) หรืออัปโหลดไฟล์ชุด .shp / .shx ไม่สัมพันธ์กัน")
+            raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {err_msg}")
 
+    # ด่านสุดท้าย ตรวจสอบโครงสร้างก่อนนำไปประมวลผล
     if gdf is None or gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
-    if gdf.geometry.isna().all():
-        raise HTTPException(400, "Shapefile มีข้อมูลแต่ geometry ว่างทั้งหมด")
+    if not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
+        raise HTTPException(400, "Shapefile มีข้อมูลแต่โครงสร้างรูปแปลงว่างเปล่าทั้งหมด")
+    if getattr(gdf, "_geometry_column_name", None) is None:
+        if "geometry" in gdf.columns:
+            gdf = gdf.set_geometry("geometry")
+        else:
+            raise HTTPException(400, "ไฟล์ Shapefile ชำรุด (ไม่พบคอลัมน์รูปแปลง)")
 
     if gdf.crs is None:
         log.warning("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
-        gdf = gdf.set_crs(epsg=32647, allow_override=True)
+        try:
+            gdf = gdf.set_crs(epsg=32647, allow_override=True)
+        except Exception as e:
+            log.warning(f"[GIS] set_crs fallback error: {e}")
 
     try:
         gdf84 = gdf.to_crs(epsg=4326)
