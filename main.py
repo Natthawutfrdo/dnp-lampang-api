@@ -9,6 +9,8 @@ DNP GIS Case API — Production v5.0
    - ไม่มีการเปลี่ยน DB schema — backward compatible กับข้อมูลเดิมทั้งหมด
    - shapefile_url จะเป็น URL ของ .shp ไฟล์ (แทน .zip)
    - เพิ่ม endpoint /upload-shp-parts/ สำหรับ upload แยก แล้วคืน URLs ทุกไฟล์
+
+🆕 v5.0.1: เพิ่มฟิลด์ complaint_no, criminal_no, seizure_no ในตาราง wildlife_cases
 """
 
 import os, shutil, tempfile, json, math, time, logging, glob, traceback, re, zipfile
@@ -34,7 +36,7 @@ log = logging.getLogger(__name__)
 app = FastAPI(
     title="DNP GIS Case API",
     description="ระบบบริการข้อมูลสารบบคดีและแผนที่เชิงพื้นที่ สบอ.13 ลำปาง",
-    version="5.0",
+    version="5.0.1",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -175,10 +177,6 @@ async def assemble_shapefile(
     prj_file: Optional[UploadFile] = None,
     cpg_file: Optional[UploadFile] = None,
 ) -> str:
-    """
-    เขียนไฟล์ Shapefile ที่แยกมาทั้งหมดลงใน tmpdir/input.*
-    คืน path ของ .shp หลัก
-    """
     base = os.path.join(tmpdir, "input")
 
     async def write_part(upload: UploadFile, ext: str):
@@ -253,7 +251,7 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
         return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
 
 # ─────────────────────────────────────────────────
-# 9. GIS EXTRACTION — รับ shp_path โดยตรง (ไม่ต้อง unzip)
+# 9. GIS EXTRACTION
 # ─────────────────────────────────────────────────
 def _read_shp_via_fiona(shp_path: str):
     import fiona
@@ -341,7 +339,6 @@ def _read_shp_via_fiona(shp_path: str):
     rows = [r for r in rows if r.get("geometry") is not None]
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
 
-    # CRS fallback chain
     crs_set = False
     if crs_wkt:
         for method, fn in [
@@ -375,10 +372,6 @@ def _read_shp_via_fiona(shp_path: str):
 
 
 def extract_gis_from_shp(shp_path: str) -> dict:
-    """
-    คำนวณพิกัดกลาง + พื้นที่จาก .shp path โดยตรง
-    (ไม่ต้อง unzip — ไฟล์ถูก assemble ไว้แล้วใน tmpdir)
-    """
     from shapely.validation import make_valid
 
     log.info(f"[GIS] reading shp: {shp_path}")
@@ -484,7 +477,6 @@ def upload_bytes_to_storage(
     data: bytes,
     content_type: str = "application/octet-stream",
 ) -> str:
-    """Upload bytes โดยตรง (ไม่ต้องเขียน temp file)"""
     db.storage.from_(bucket).upload(
         path=path,
         file=data,
@@ -496,7 +488,6 @@ def upload_bytes_to_storage(
     )
     return db.storage.from_(bucket).get_public_url(path)
 
-# content-type map สำหรับ shapefile parts
 SHP_CONTENT_TYPES = {
     ".shp": "application/octet-stream",
     ".dbf": "application/dbase",
@@ -514,9 +505,9 @@ SHP_CONTENT_TYPES = {
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "message": "DNP GIS Case API v5.0 is running!",
+        "message": "DNP GIS Case API v5.0.1 is running!",
         "status": "ok",
-        "version": "5.0",
+        "version": "5.0.1",
         "upload_mode": "separate_files (.shp .dbf .shx .prj)",
     }
 
@@ -526,10 +517,10 @@ def health():
         "api": "ok",
         "db": "connected" if supabase else "disconnected",
         "cors_origins": ALLOWED_ORIGINS,
-        "version": "5.0",
+        "version": "5.0.1",
     }
 
-# ── วิเคราะห์ Shapefile (แยกไฟล์ — ไม่บันทึก DB) ──────────────────────────
+# ── วิเคราะห์ Shapefile ────────────────────────────────────────────────────
 @app.post("/analyze-shapefile/", tags=["GIS"])
 async def analyze_shapefile(
     shp_file: UploadFile = File(..., description="ไฟล์ .shp"),
@@ -538,10 +529,6 @@ async def analyze_shapefile(
     prj_file: Optional[UploadFile] = File(None, description="ไฟล์ .prj (แนะนำ)"),
     cpg_file: Optional[UploadFile] = File(None, description="ไฟล์ .cpg (optional)"),
 ):
-    """
-    รับไฟล์ Shapefile แยกส่วน → วิเคราะห์พิกัด + พื้นที่
-    ไม่บันทึกลง DB ใช้สำหรับ preview ก่อนบันทึก
-    """
     with tempfile.TemporaryDirectory() as tmp:
         shp_path = await assemble_shapefile(
             tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
@@ -560,7 +547,7 @@ async def analyze_shapefile(
         "utm_northing": gis["utm_northing"],
     }
 
-# ── อัปโหลด Shapefile parts ขึ้น Storage (แยก endpoint) ───────────────────
+# ── อัปโหลด Shapefile parts ────────────────────────────────────────────────
 @app.post("/upload-shp-parts/", tags=["GIS"])
 async def upload_shp_parts(
     shp_file: UploadFile = File(...),
@@ -571,18 +558,12 @@ async def upload_shp_parts(
     prefix:   str = Form("case"),
     db: Client = Depends(get_db),
 ):
-    """
-    อัปโหลด Shapefile ทุกไฟล์ขึ้น Supabase Storage
-    คืน URLs ของทุกส่วน + geojson_url
-    """
     safe_prefix = prefix.replace("/", "_").replace(" ", "_")
 
     with tempfile.TemporaryDirectory() as tmp:
         shp_path = await assemble_shapefile(
             tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
         )
-
-        # วิเคราะห์ GIS ก่อน upload
         gis = extract_gis_from_shp(shp_path)
 
         urls = {}
@@ -596,7 +577,6 @@ async def upload_shp_parts(
         if cpg_file and cpg_file.filename:
             parts[".cpg"] = cpg_file
 
-        # Upload แต่ละส่วน
         for ext, upload in parts.items():
             storage_path = f"{safe_prefix}{ext}"
             local_path   = os.path.join(tmp, f"input{ext}")
@@ -607,7 +587,6 @@ async def upload_shp_parts(
             except Exception as e:
                 log.warning(f"Upload {ext} failed: {e}")
 
-        # Upload GeoJSON
         geojson_path = os.path.join(tmp, f"{safe_prefix}_map.json")
         with open(geojson_path, "w", encoding="utf-8") as jf:
             jf.write(gis["gdf84"].to_json())
@@ -635,7 +614,7 @@ async def upload_shp_parts(
         "shp_url":      urls.get("shp", ""),
     }
 
-# ── บันทึกคดีบุกรุก / ไม้ (แยกไฟล์) ──────────────────────────────────────
+# ── บันทึกคดีบุกรุก / ไม้ ─────────────────────────────────────────────────
 @app.post("/process-shapefile/", tags=["Cases"])
 async def process_shapefile(
     shp_file:       UploadFile = File(..., description="ไฟล์ .shp"),
@@ -682,12 +661,9 @@ async def process_shapefile(
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # ── Assemble shapefile ────────────────────────────────────────────
             shp_path = await assemble_shapefile(
                 tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
             )
-
-            # ── วิเคราะห์ GIS ─────────────────────────────────────────────────
             gis = extract_gis_from_shp(shp_path)
 
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
@@ -698,7 +674,6 @@ async def process_shapefile(
             f_wa       = int(round(wa)) if wa    > 0 else gis["wa"]
             coords     = [gis["lat"], gis["lon"]]
 
-            # ── Upload Shapefile parts ────────────────────────────────────────
             shp_url = ""
             part_files = {
                 ".shp": os.path.join(tmp, "input.shp"),
@@ -716,13 +691,12 @@ async def process_shapefile(
                 try:
                     url = upload_to_storage(db, "dnp-shapefiles", storage_path, local_path, ct)
                     if ext == ".shp":
-                        shp_url = url   # ใช้ .shp URL เป็น shapefile_url หลัก
+                        shp_url = url
                 except Exception as e:
                     log.warning(f"Upload {ext} failed: {e}")
                     if ext == ".shp":
                         return JSONResponse({"success": False, "error": f"อัปโหลด .shp ล้มเหลว: {e}"})
 
-            # ── Upload PDF ────────────────────────────────────────────────────
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 pdf_fn  = f"{safe_key}_{pdf_file.filename.replace(' ', '_')}"
@@ -734,7 +708,6 @@ async def process_shapefile(
                 except Exception as e:
                     log.warning(f"PDF upload failed: {e}")
 
-            # ── สร้าง + Upload GeoJSON ─────────────────────────────────────────
             geojson_fn   = f"{safe_key}_map.json"
             geojson_path = os.path.join(tmp, geojson_fn)
             with open(geojson_path, "w", encoding="utf-8") as jf:
@@ -748,7 +721,6 @@ async def process_shapefile(
 
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
 
-            # ── Insert DB ─────────────────────────────────────────────────────
             try:
                 if case_type == "encroachment":
                     row: dict = {
@@ -763,7 +735,7 @@ async def process_shapefile(
                         "coords":         coords,
                         "agency":         agency,
                         "suspects_count": suspects_count,
-                        "shapefile_url":  shp_url,   # URL ของ .shp
+                        "shapefile_url":  shp_url,
                         "pdf_url":        pdf_url,
                         "geojson_data":   geojson_url,
                         "utm_zone":       f_zone,
@@ -829,11 +801,17 @@ async def process_shapefile(
         log.exception("process_shapefile error")
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── บันทึกคดีสัตว์ป่า (ไม่เปลี่ยน — ไม่มี shapefile) ──────────────────────
+# ── บันทึกคดีสัตว์ป่า ─────────────────────────────────────────────────────
+# 🆕 v5.0.1: รับ complaint_no, criminal_no, seizure_no เพิ่ม
+#    ใช้ check_columns เพื่อ backward-compat กับ DB เดิม
+# ──────────────────────────────────────────────────────────────────────────
 @app.post("/process-wildlife/", tags=["Cases"])
 async def process_wildlife(
     pdf_file:       UploadFile = File(None),
     case_no:        str   = Form(...),
+    complaint_no:   str   = Form(""),      # 🆕
+    criminal_no:    str   = Form(""),      # 🆕
+    seizure_no:     str   = Form(""),      # 🆕
     case_date:      str   = Form(""),
     location:       str   = Form(...),
     status:         str   = Form(...),
@@ -849,6 +827,7 @@ async def process_wildlife(
     utm_northing:   int   = Form(0),
     db: Client = Depends(get_db),
 ):
+    # ── PDF upload ──────────────────────────────────────────────────────────
     pdf_url = ""
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
@@ -876,8 +855,13 @@ async def process_wildlife(
         except Exception:
             coords = [18.29, 99.50]
 
+    # ── ตรวจว่า wildlife_cases มีคอลัมน์ใหม่หรือยัง ─────────────────────
+    wl_new_cols = check_columns(
+        "wildlife_cases", ["complaint_no", "criminal_no", "seizure_no"]
+    )
+
     try:
-        db.table("wildlife_cases").insert({
+        row: dict = {
             "case_no":        case_no,
             "case_date":      case_date,
             "location":       location,
@@ -892,14 +876,32 @@ async def process_wildlife(
             "utm_zone":       f_zone,
             "utm_easting":    f_east,
             "utm_northing":   f_north,
-        }).execute()
+        }
+
+        if wl_new_cols:
+            # ── DB มีคอลัมน์ใหม่แล้ว → ใส่ตรงๆ ───────────────────────────
+            row["complaint_no"] = complaint_no
+            row["criminal_no"]  = criminal_no
+            row["seizure_no"]   = seizure_no
+        else:
+            # ── DB ยังไม่มี → ยัดไว้ใน case_status ชั่วคราว ───────────────
+            extra = ""
+            if complaint_no: extra += f"\n[แจ้ง: {complaint_no}]"
+            if criminal_no:  extra += f"\n[อาญา: {criminal_no}]"
+            if seizure_no:   extra += f"\n[ยึดทรัพย์: {seizure_no}]"
+            if extra:
+                row["case_status"] = case_status + extra
+
+        db.table("wildlife_cases").insert(row).execute()
+
         return {
-            "success":      True,
-            "message":      "บันทึกคดีสัตว์ป่าสำเร็จ",
-            "coords":       coords,
-            "utm_zone":     f_zone,
-            "utm_easting":  f_east,
-            "utm_northing": f_north,
+            "success":          True,
+            "message":          "บันทึกคดีสัตว์ป่าสำเร็จ",
+            "coords":           coords,
+            "utm_zone":         f_zone,
+            "utm_easting":      f_east,
+            "utm_northing":     f_north,
+            "schema_upgraded":  wl_new_cols,
         }
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
@@ -946,7 +948,7 @@ async def delete_case(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# ── UTM Converter endpoint ────────────────────────────────────────────────
+# ── UTM Converter ──────────────────────────────────────────────────────────
 @app.get("/convert-utm", tags=["Utils"])
 def convert_utm_api(
     zone:     int   = Query(47),
@@ -960,7 +962,7 @@ def convert_utm_api(
     except Exception as e:
         raise HTTPException(400, f"แปลงพิกัดไม่ได้: {e}")
 
-# ── Reload schema cache ───────────────────────────────────────────────────
+# ── Reload schema cache ────────────────────────────────────────────────────
 @app.post("/reload-schema/", tags=["Admin"])
 async def reload_schema(db: Client = Depends(get_db)):
     clear_schema_cache()
@@ -970,7 +972,7 @@ async def reload_schema(db: Client = Depends(get_db)):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-# ── Debug endpoint ────────────────────────────────────────────────────────
+# ── Debug endpoint ─────────────────────────────────────────────────────────
 @app.post("/debug-shp/", tags=["Debug"])
 async def debug_shp(
     shp_file: UploadFile = File(...),
@@ -979,7 +981,6 @@ async def debug_shp(
     prj_file: Optional[UploadFile] = File(None),
     cpg_file: Optional[UploadFile] = File(None),
 ):
-    """ตรวจสอบ Shapefile แยกไฟล์แบบละเอียด"""
     result: dict = {}
     try:
         with tempfile.TemporaryDirectory() as tmp:
