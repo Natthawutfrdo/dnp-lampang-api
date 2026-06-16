@@ -288,6 +288,30 @@ def _read_shp_via_fiona(shp_path: str):
     if not rows:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
 
+    # ── ตรวจ geometry ก่อนสร้าง GeoDataFrame ──────────────────────────────
+    # ถ้าทุก row เป็น None → fiona อ่าน geometry ไม่ได้ → ลอง gpd.read_file ตรง
+    valid_geom_count = sum(1 for r in rows if r.get("geometry") is not None)
+    log.info(f"[GIS][fiona] valid geometry: {valid_geom_count}/{len(rows)}")
+
+    if valid_geom_count == 0:
+        log.warning("[GIS][fiona] geometry ว่างทั้งหมด → ลอง gpd.read_file ตรง")
+        for enc in ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]:
+            try:
+                _tmp = gpd.read_file(shp_path, encoding=enc)
+                if _tmp is not None and len(_tmp) > 0 and not _tmp.geometry.isna().all():
+                    log.info(f"[GIS][fiona→gpd] gpd.read_file ok: enc={enc}, rows={len(_tmp)}")
+                    return _tmp   # คืนตรงเลย CRS ติดมาด้วย
+            except Exception as eg:
+                log.warning(f"[GIS][fiona→gpd] enc={enc} failed: {eg}")
+        raise HTTPException(
+            400,
+            "Shapefile อ่าน geometry ไม่ได้ — ลอง fiona และ geopandas แล้วทุกแบบ "
+            "กรุณาตรวจสอบว่า .shp .shx .dbf .prj ครบและไม่เสียหาย"
+        )
+
+    # กรอง row ที่ geometry เป็น None ออก (บาง feature อาจ null ได้)
+    rows = [r for r in rows if r.get("geometry") is not None]
+
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
 
     # ════════════════════════════════════════════════════════════
