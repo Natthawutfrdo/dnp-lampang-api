@@ -1,15 +1,17 @@
 """
-DNP GIS Case API — Production v4.2
+DNP GIS Case API — Production v5.0
 ระบบ API สารบบคดีเชิงพื้นที่ สบอ.13 ลำปาง
-แก้ไข: CORS, response format, pagination, schema cache, error handling
-🔧 v4.1: แก้ validate_file นามสกุลไฟล์ (เพิ่มจุดนำหน้า ext)
-🔧 v4.1: เพิ่ม /debug-multipolygon/ endpoint สำหรับ debug MultiPolygon
-🔧 v4.2: แก้ extract_gis — ตรวจ geometry.isna().all() ก่อนถือว่า gpd สำเร็จ
-🔧 v4.2: แก้ _read_shp_via_fiona — CRS fallback 4 ชั้น รองรับ pyproj ทุกเวอร์ชัน
-         (from_wkt str → from_wkt bytes → from_user_input → parse EPSG → default)
+
+🔧 v5.0 REFACTOR: รับไฟล์ Shapefile แยกส่วน (.shp .dbf .shx .prj ฯลฯ)
+   แทนการส่งเป็น ZIP เดียว
+   - endpoint /analyze-shapefile/ รับ: shp_file, dbf_file, shx_file, prj_file (optional)
+   - endpoint /process-shapefile/ รับ: shp_file, dbf_file, shx_file, prj_file, pdf_file
+   - ไม่มีการเปลี่ยน DB schema — backward compatible กับข้อมูลเดิมทั้งหมด
+   - shapefile_url จะเป็น URL ของ .shp ไฟล์ (แทน .zip)
+   - เพิ่ม endpoint /upload-shp-parts/ สำหรับ upload แยก แล้วคืน URLs ทุกไฟล์
 """
 
-import os, shutil, tempfile, zipfile, json, math, time, logging, glob, traceback, re
+import os, shutil, tempfile, json, math, time, logging, glob, traceback, re, zipfile
 from typing import Optional, List
 from functools import lru_cache
 
@@ -32,12 +34,11 @@ log = logging.getLogger(__name__)
 app = FastAPI(
     title="DNP GIS Case API",
     description="ระบบบริการข้อมูลสารบบคดีและแผนที่เชิงพื้นที่ สบอ.13 ลำปาง",
-    version="4.2",
+    version="5.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# ── CORS ──────────────────────────────────────────
 ALLOWED_ORIGINS: List[str] = [
     o.strip()
     for o in os.environ.get(
@@ -56,7 +57,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ─────────────────────────────────────────────────
@@ -86,7 +86,7 @@ def get_db() -> Client:
 # 4. SCHEMA CACHE
 # ─────────────────────────────────────────────────
 _schema_cache: dict[str, tuple[bool, float]] = {}
-SCHEMA_TTL = 300  # 5 นาที
+SCHEMA_TTL = 300
 
 def check_columns(table: str, columns: list[str]) -> bool:
     key = f"{table}:{','.join(sorted(columns))}"
@@ -124,7 +124,6 @@ def get_table(case_type: str) -> str:
 
 # ─────────────────────────────────────────────────
 # 6. FILE VALIDATION
-# 🔧 FIX: normalize ext ให้มีจุดเสมอ ไม่ว่าจะส่งมาว่า "zip" หรือ ".zip"
 # ─────────────────────────────────────────────────
 async def validate_file(
     file: UploadFile,
@@ -140,11 +139,70 @@ async def validate_file(
     await file.seek(0)
     return content
 
+async def validate_shp_parts(
+    shp_file: UploadFile,
+    dbf_file: UploadFile,
+    shx_file: UploadFile,
+) -> dict[str, bytes]:
+    """
+    ตรวจสอบและอ่าน bytes ของไฟล์ Shapefile แยกส่วน
+    บังคับ: .shp .dbf .shx  |  optional: .prj .cpg
+    """
+    errors = []
+    if not shp_file or not shp_file.filename.lower().endswith(".shp"):
+        errors.append("ต้องแนบไฟล์ .shp")
+    if not dbf_file or not dbf_file.filename.lower().endswith(".dbf"):
+        errors.append("ต้องแนบไฟล์ .dbf")
+    if not shx_file or not shx_file.filename.lower().endswith(".shx"):
+        errors.append("ต้องแนบไฟล์ .shx")
+    if errors:
+        raise HTTPException(400, " | ".join(errors))
+
+    result = {}
+    result["shp"] = await shp_file.read()
+    result["dbf"] = await dbf_file.read()
+    result["shx"] = await shx_file.read()
+    return result
+
 # ─────────────────────────────────────────────────
-# 7. UTM / LAT-LON HELPERS
+# 7. SHAPEFILE ASSEMBLY — เขียนลง tmpdir แล้วคืน path
+# ─────────────────────────────────────────────────
+async def assemble_shapefile(
+    tmpdir: str,
+    shp_file: UploadFile,
+    dbf_file: UploadFile,
+    shx_file: UploadFile,
+    prj_file: Optional[UploadFile] = None,
+    cpg_file: Optional[UploadFile] = None,
+) -> str:
+    """
+    เขียนไฟล์ Shapefile ที่แยกมาทั้งหมดลงใน tmpdir/input.*
+    คืน path ของ .shp หลัก
+    """
+    base = os.path.join(tmpdir, "input")
+
+    async def write_part(upload: UploadFile, ext: str):
+        content = await upload.read()
+        with open(f"{base}{ext}", "wb") as f:
+            f.write(content)
+
+    await write_part(shp_file, ".shp")
+    await write_part(dbf_file, ".dbf")
+    await write_part(shx_file, ".shx")
+
+    if prj_file and prj_file.filename:
+        await write_part(prj_file, ".prj")
+    if cpg_file and cpg_file.filename:
+        await write_part(cpg_file, ".cpg")
+
+    shp_path = f"{base}.shp"
+    log.info(f"[ASSEMBLE] shapefile ready: {shp_path}")
+    return shp_path
+
+# ─────────────────────────────────────────────────
+# 8. UTM / LAT-LON HELPERS
 # ─────────────────────────────────────────────────
 def utm_to_latlon(zone: int, easting: float, northing: float, is_north: bool = True) -> dict:
-    """แปลง UTM (WGS84) → Lat/Lon"""
     k0 = 0.9996; a = 6378137.0; e = 0.0818191908426215
     e2 = e*e; e4 = e2*e2; e6 = e4*e2; e1sq = e2/(1-e2)
     x = easting - 500000.0
@@ -169,7 +227,6 @@ def utm_to_latlon(zone: int, easting: float, northing: float, is_north: bool = T
     return {"lat": math.degrees(lat), "lon": lon0 + math.degrees(lon)}
 
 def latlon_to_utm(lat: float, lon: float) -> dict:
-    """แปลง Lat/Lon → UTM (WGS84)"""
     try:
         zone = int((lon + 180)/6) + 1
         k0=0.9996; a=6378137.0; e=0.0818191908426215
@@ -196,20 +253,9 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
         return {"utm_zone": 47, "utm_easting": 0, "utm_northing": 0}
 
 # ─────────────────────────────────────────────────
-# 8. GIS EXTRACTION  (🔧 v4.2 — full fix)
+# 9. GIS EXTRACTION — รับ shp_path โดยตรง (ไม่ต้อง unzip)
 # ─────────────────────────────────────────────────
-
 def _read_shp_via_fiona(shp_path: str):
-    """
-    Fallback: อ่าน Shapefile ด้วย fiona โดยตรง
-
-    🔧 v4.2 FIX — CRS fallback 4 ชั้น:
-      1. ProjCRS.from_wkt(str)         — pyproj >= 3.x มาตรฐาน
-      2. ProjCRS.from_wkt(bytes)       — pyproj บางเวอร์ชันต้องการ bytes
-      3. ProjCRS.from_user_input(str)  — รองรับกว้างกว่า from_wkt
-      4. parse EPSG code จาก wkt str  — regex หา AUTHORITY["EPSG","XXXXX"]
-      5. default EPSG:32647            — UTM Zone 47N (ภาคเหนือไทย)
-    """
     import fiona
     import geopandas as gpd
     from shapely.geometry import shape
@@ -221,10 +267,8 @@ def _read_shp_via_fiona(shp_path: str):
 
     for enc in _ENCODINGS:
         try:
-            # ทดสอบอ่านจริงก่อน
             with fiona.open(shp_path, encoding=enc) as s:
                 _ = list(s)
-            # ผ่านแล้ว เปิดจริง
             src = fiona.open(shp_path, encoding=enc)
             log.info(f"[GIS][fiona] encoding ok: {enc}")
             break
@@ -241,15 +285,13 @@ def _read_shp_via_fiona(shp_path: str):
     crs_wkt = None
 
     with src:
-        crs_wkt = src.crs_wkt  # อาจเป็น None ถ้าไม่มี .prj
-
+        crs_wkt = src.crs_wkt
         for feat in src:
-            # อ่าน geometry รองรับทุกเวอร์ชัน fiona
             raw = None
             try:
-                raw = feat["geometry"]           # fiona 1.9+ (dict / MappingProxy)
+                raw = feat["geometry"]
             except (KeyError, TypeError):
-                raw = getattr(feat, "geometry", None)  # fiona legacy
+                raw = getattr(feat, "geometry", None)
 
             geom = None
             if raw is not None:
@@ -258,7 +300,6 @@ def _read_shp_via_fiona(shp_path: str):
                         from shapely import wkb
                         geom = wkb.loads(raw)
                     elif isinstance(raw, str):
-                        # fiona บางเวอร์ชันส่ง WKT string
                         from shapely import wkt as swkt
                         geom = swkt.loads(raw)
                     elif isinstance(raw, dict):
@@ -266,13 +307,9 @@ def _read_shp_via_fiona(shp_path: str):
                     elif hasattr(raw, "__geo_interface__"):
                         geom = shape(raw.__geo_interface__)
                     else:
-                        # fiona MappingProxy หรือ object อื่น
                         geom = shape(dict(raw))
                 except Exception as eg:
-                    log.warning(
-                        f"[GIS][fiona] geom parse error: {eg} "
-                        f"(type={type(raw).__name__})"
-                    )
+                    log.warning(f"[GIS][fiona] geom parse error: {eg}")
 
             if geom is not None and not geom.is_valid:
                 geom = make_valid(geom)
@@ -282,14 +319,11 @@ def _read_shp_via_fiona(shp_path: str):
                 props = dict(feat.properties)
             except Exception:
                 pass
-
             rows.append({"geometry": geom, **props})
 
     if not rows:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
 
-    # ── ตรวจ geometry ก่อนสร้าง GeoDataFrame ──────────────────────────────
-    # ถ้าทุก row เป็น None → fiona อ่าน geometry ไม่ได้ → ลอง gpd.read_file ตรง
     valid_geom_count = sum(1 for r in rows if r.get("geometry") is not None)
     log.info(f"[GIS][fiona] valid geometry: {valid_geom_count}/{len(rows)}")
 
@@ -299,145 +333,61 @@ def _read_shp_via_fiona(shp_path: str):
             try:
                 _tmp = gpd.read_file(shp_path, encoding=enc)
                 if _tmp is not None and len(_tmp) > 0 and not _tmp.geometry.isna().all():
-                    log.info(f"[GIS][fiona→gpd] gpd.read_file ok: enc={enc}, rows={len(_tmp)}")
-                    return _tmp   # คืนตรงเลย CRS ติดมาด้วย
+                    return _tmp
             except Exception as eg:
                 log.warning(f"[GIS][fiona→gpd] enc={enc} failed: {eg}")
-        raise HTTPException(
-            400,
-            "Shapefile อ่าน geometry ไม่ได้ — ลอง fiona และ geopandas แล้วทุกแบบ "
-            "กรุณาตรวจสอบว่า .shp .shx .dbf .prj ครบและไม่เสียหาย"
-        )
+        raise HTTPException(400, "Shapefile อ่าน geometry ไม่ได้")
 
-    # กรอง row ที่ geometry เป็น None ออก (บาง feature อาจ null ได้)
     rows = [r for r in rows if r.get("geometry") is not None]
-
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
 
-    # ════════════════════════════════════════════════════════════
-    # 🔧 v4.2 FIX: ตั้ง CRS รองรับ pyproj ทุกเวอร์ชัน
-    # ════════════════════════════════════════════════════════════
+    # CRS fallback chain
     crs_set = False
-
     if crs_wkt:
-        # ── วิธีที่ 1: from_wkt(str) — มาตรฐาน pyproj >= 3.x ──────────────
-        if not crs_set:
+        for method, fn in [
+            ("from_wkt(str)", lambda: ProjCRS.from_wkt(crs_wkt)),
+            ("from_wkt(bytes)", lambda: ProjCRS.from_wkt(crs_wkt.encode("utf-8") if isinstance(crs_wkt, str) else crs_wkt)),
+            ("from_user_input", lambda: ProjCRS.from_user_input(crs_wkt)),
+        ]:
+            if crs_set:
+                break
             try:
-                crs_obj = ProjCRS.from_wkt(crs_wkt)
-                gdf = gdf.set_crs(crs_obj, allow_override=True)
+                gdf = gdf.set_crs(fn(), allow_override=True)
                 crs_set = True
-                log.info("[GIS] CRS: from_wkt(str) ok")
-            except TypeError as e:
-                log.warning(f"[GIS] from_wkt(str) TypeError: {e} → ลอง bytes")
+                log.info(f"[GIS] CRS: {method} ok")
             except Exception as e:
-                log.warning(f"[GIS] from_wkt(str) failed: {e}")
+                log.warning(f"[GIS] {method} failed: {e}")
 
-        # ── วิธีที่ 2: from_wkt(bytes) — pyproj บางเวอร์ชันต้องการ bytes ───
         if not crs_set:
-            try:
-                wkt_bytes = (
-                    crs_wkt.encode("utf-8") if isinstance(crs_wkt, str) else crs_wkt
-                )
-                crs_obj = ProjCRS.from_wkt(wkt_bytes)
-                gdf = gdf.set_crs(crs_obj, allow_override=True)
+            m = re.search(r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"', crs_wkt, re.IGNORECASE)
+            if not m:
+                m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt, re.IGNORECASE)
+            if m:
+                gdf = gdf.set_crs(epsg=int(m.group(1)), allow_override=True)
                 crs_set = True
-                log.info("[GIS] CRS: from_wkt(bytes) ok")
-            except Exception as e:
-                log.warning(f"[GIS] from_wkt(bytes) failed: {e}")
+                log.info(f"[GIS] CRS: parsed EPSG:{m.group(1)}")
 
-        # ── วิธีที่ 3: from_user_input — รองรับกว้างที่สุด ─────────────────
-        if not crs_set:
-            try:
-                crs_obj = ProjCRS.from_user_input(crs_wkt)
-                gdf = gdf.set_crs(crs_obj, allow_override=True)
-                crs_set = True
-                log.info("[GIS] CRS: from_user_input ok")
-            except Exception as e:
-                log.warning(f"[GIS] from_user_input failed: {e}")
-
-        # ── วิธีที่ 4: regex หา EPSG code จาก wkt string ──────────────────
-        if not crs_set:
-            try:
-                # pattern มาตรฐาน WKT: AUTHORITY["EPSG","32647"]
-                m = re.search(
-                    r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"',
-                    crs_wkt,
-                    re.IGNORECASE,
-                )
-                if not m:
-                    # fallback pattern: EPSG:32647 หรือ EPSG,32647
-                    m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt, re.IGNORECASE)
-                if m:
-                    epsg_code = int(m.group(1))
-                    gdf = gdf.set_crs(epsg=epsg_code, allow_override=True)
-                    crs_set = True
-                    log.info(f"[GIS] CRS: parsed EPSG:{epsg_code} from wkt")
-                else:
-                    log.warning("[GIS] ไม่พบ EPSG code ใน wkt string")
-            except Exception as e:
-                log.warning(f"[GIS] EPSG parse from wkt failed: {e}")
-
-    # ── วิธีสุดท้าย: default UTM Zone 47N ──────────────────────────────────
     if not crs_set:
-        log.warning("[GIS] CRS ไม่สามารถตั้งได้ — ใช้ EPSG:32647 (UTM47N)")
+        log.warning("[GIS] CRS ไม่สามารถตั้งได้ — ใช้ EPSG:32647")
         gdf = gdf.set_crs(epsg=32647, allow_override=True)
 
     return gdf
 
 
-def extract_gis(zip_path: str, extract_dir: str) -> dict:
-    """แตก Shapefile จาก ZIP แล้วคำนวณพิกัดกลาง + พื้นที่"""
-    import fiona
-    from shapely.geometry import shape
+def extract_gis_from_shp(shp_path: str) -> dict:
+    """
+    คำนวณพิกัดกลาง + พื้นที่จาก .shp path โดยตรง
+    (ไม่ต้อง unzip — ไฟล์ถูก assemble ไว้แล้วใน tmpdir)
+    """
     from shapely.validation import make_valid
 
-    # ── แตก ZIP ──────────────────────────────────────────────────────────────
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(extract_dir)
-    except Exception:
-        raise HTTPException(400, "ไฟล์ ZIP ไม่สมบูรณ์หรือเสียหาย")
-
-    # ── หา .shp ──────────────────────────────────────────────────────────────
-    shp_files = (
-        glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True) +
-        glob.glob(os.path.join(extract_dir, "**", "*.SHP"), recursive=True)
-    )
-    shp_files = [f for f in shp_files if "__MACOSX" not in f]
-    if not shp_files:
-        raise HTTPException(400, "ไม่พบไฟล์ .shp ใน ZIP")
-
-    # ── copy ไปที่ safe_dir (ชื่อ ASCII ล้วน) ────────────────────────────────
-    original_shp = shp_files[0]
-    shp_dir = os.path.dirname(original_shp)
-    safe_dir = os.path.join(extract_dir, "safe")
-    os.makedirs(safe_dir, exist_ok=True)
-
-    for f in glob.glob(os.path.join(shp_dir, "*")):
-        ext = os.path.splitext(f)[1].lower()
-        if ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx"):
-            try:
-                shutil.copy2(f, os.path.join(safe_dir, f"input{ext}"))
-            except Exception:
-                pass
-
-    shp_path = os.path.join(safe_dir, "input.shp")
-    if not os.path.exists(shp_path):
-        shp_path = original_shp
-
-    log.info(f"[GIS] reading: {shp_path}")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # 🔧 v4.2 FIX: ลอง gpd.read_file ก่อน แต่ตรวจ geometry ด้วย
-    # ถ้า geometry เป็น None ทั้งหมด ให้ถือว่าล้มเหลวและไป fiona fallback
-    # ════════════════════════════════════════════════════════════════════════
+    log.info(f"[GIS] reading shp: {shp_path}")
     gdf = None
     last_err = None
 
     for enc in ["utf-8", "tis-620", "cp874", "cp1252", "latin-1"]:
         try:
             _tmp = gpd.read_file(shp_path, encoding=enc)
-            # 🔧 FIX: ต้องมีทั้ง rows และ geometry จริงๆ
             if (
                 _tmp is not None
                 and len(_tmp) > 0
@@ -447,20 +397,14 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
                 log.info(f"[GIS] gpd.read_file ok: encoding={enc}, rows={len(gdf)}")
                 break
             else:
-                log.warning(
-                    f"[GIS] gpd.read_file({enc}): rows={len(_tmp) if _tmp is not None else 0}, "
-                    f"geometry all-null={_tmp.geometry.isna().all() if _tmp is not None and len(_tmp) > 0 else True}"
-                )
+                log.warning(f"[GIS] gpd.read_file({enc}): geometry all-null or empty")
         except UnicodeDecodeError as e:
             last_err = e
-            log.warning(f"[GIS] encoding {enc} UnicodeDecodeError: {e}")
-            gdf = None
         except Exception as e:
             last_err = e
             log.warning(f"[GIS] gpd.read_file({enc}) error: {e}")
             gdf = None
 
-    # ── ถ้า gpd ล้มเหลวทุก encoding → ใช้ fiona fallback ──────────────────
     if gdf is None or gdf.empty or gdf.geometry.isna().all():
         log.warning("[GIS] gpd fallback → fiona manual read")
         try:
@@ -472,16 +416,13 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
 
     if gdf is None or gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
-
     if gdf.geometry.isna().all():
         raise HTTPException(400, "Shapefile มีข้อมูลแต่ geometry ว่างทั้งหมด")
 
-    # ── ตั้ง CRS (ถ้ายังไม่มี default เป็น UTM47) ────────────────────────────
     if gdf.crs is None:
         log.warning("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
         gdf = gdf.set_crs(epsg=32647, allow_override=True)
 
-    # ── แปลงพิกัด → WGS84 ────────────────────────────────────────────────────
     try:
         gdf84 = gdf.to_crs(epsg=4326)
         c = gdf84.geometry.centroid.iloc[0]
@@ -491,7 +432,6 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
         lat, lon = 18.29, 99.50
         gdf84 = gdf
 
-    # ── คำนวณพื้นที่ ──────────────────────────────────────────────────────────
     try:
         area_sqm = max(float(gdf.to_crs(epsg=32647).geometry.area.sum()), 0.0)
     except Exception:
@@ -502,11 +442,8 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     ngarn = int((total_wa % 400) // 100)
     wa    = int(round(total_wa % 100))
 
-    # ── Simplify สำหรับ GeoJSON ────────────────────────────────────────────────
     try:
-        gdf84["geometry"] = gdf84["geometry"].simplify(
-            tolerance=0.0001, preserve_topology=True
-        )
+        gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
         pass
 
@@ -519,7 +456,7 @@ def extract_gis(zip_path: str, extract_dir: str) -> dict:
     }
 
 # ─────────────────────────────────────────────────
-# 9. STORAGE UPLOAD HELPER
+# 10. STORAGE UPLOAD HELPER
 # ─────────────────────────────────────────────────
 def upload_to_storage(
     db: Client,
@@ -528,7 +465,6 @@ def upload_to_storage(
     file_path: str,
     content_type: str = "application/octet-stream",
 ) -> str:
-    """อัปโหลดไฟล์ขึ้น Supabase Storage แล้วคืน public URL"""
     with open(file_path, "rb") as f:
         db.storage.from_(bucket).upload(
             path=path,
@@ -541,16 +477,47 @@ def upload_to_storage(
         )
     return db.storage.from_(bucket).get_public_url(path)
 
+def upload_bytes_to_storage(
+    db: Client,
+    bucket: str,
+    path: str,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+) -> str:
+    """Upload bytes โดยตรง (ไม่ต้องเขียน temp file)"""
+    db.storage.from_(bucket).upload(
+        path=path,
+        file=data,
+        file_options={
+            "cache-control": "3600",
+            "upsert": True,
+            "content-type": content_type,
+        },
+    )
+    return db.storage.from_(bucket).get_public_url(path)
+
+# content-type map สำหรับ shapefile parts
+SHP_CONTENT_TYPES = {
+    ".shp": "application/octet-stream",
+    ".dbf": "application/dbase",
+    ".shx": "application/octet-stream",
+    ".prj": "text/plain",
+    ".cpg": "text/plain",
+    ".sbn": "application/octet-stream",
+    ".sbx": "application/octet-stream",
+}
+
 # ─────────────────────────────────────────────────
-# 10. ENDPOINTS
+# 11. ENDPOINTS
 # ─────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "message": "DNP GIS Case API v4.2 is running!",
+        "message": "DNP GIS Case API v5.0 is running!",
         "status": "ok",
-        "version": "4.2",
+        "version": "5.0",
+        "upload_mode": "separate_files (.shp .dbf .shx .prj)",
     }
 
 @app.get("/health", tags=["Health"])
@@ -559,17 +526,28 @@ def health():
         "api": "ok",
         "db": "connected" if supabase else "disconnected",
         "cors_origins": ALLOWED_ORIGINS,
+        "version": "5.0",
     }
 
-# ── วิเคราะห์ Shapefile (ไม่บันทึก DB) ──────────
+# ── วิเคราะห์ Shapefile (แยกไฟล์ — ไม่บันทึก DB) ──────────────────────────
 @app.post("/analyze-shapefile/", tags=["GIS"])
-async def analyze_shapefile(file: UploadFile = File(...)):
-    content = await validate_file(file, "zip")
+async def analyze_shapefile(
+    shp_file: UploadFile = File(..., description="ไฟล์ .shp"),
+    dbf_file: UploadFile = File(..., description="ไฟล์ .dbf"),
+    shx_file: UploadFile = File(..., description="ไฟล์ .shx"),
+    prj_file: Optional[UploadFile] = File(None, description="ไฟล์ .prj (แนะนำ)"),
+    cpg_file: Optional[UploadFile] = File(None, description="ไฟล์ .cpg (optional)"),
+):
+    """
+    รับไฟล์ Shapefile แยกส่วน → วิเคราะห์พิกัด + พื้นที่
+    ไม่บันทึกลง DB ใช้สำหรับ preview ก่อนบันทึก
+    """
     with tempfile.TemporaryDirectory() as tmp:
-        zip_path = os.path.join(tmp, "upload.zip")
-        with open(zip_path, "wb") as buf:
-            buf.write(content)
-        gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
+        shp_path = await assemble_shapefile(
+            tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
+        )
+        gis = extract_gis_from_shp(shp_path)
+
     return {
         "success":      True,
         "lat":          gis["lat"],
@@ -582,11 +560,90 @@ async def analyze_shapefile(file: UploadFile = File(...)):
         "utm_northing": gis["utm_northing"],
     }
 
-# ── บันทึกคดีบุกรุก / ไม้ ───────────────────────
+# ── อัปโหลด Shapefile parts ขึ้น Storage (แยก endpoint) ───────────────────
+@app.post("/upload-shp-parts/", tags=["GIS"])
+async def upload_shp_parts(
+    shp_file: UploadFile = File(...),
+    dbf_file: UploadFile = File(...),
+    shx_file: UploadFile = File(...),
+    prj_file: Optional[UploadFile] = File(None),
+    cpg_file: Optional[UploadFile] = File(None),
+    prefix:   str = Form("case"),
+    db: Client = Depends(get_db),
+):
+    """
+    อัปโหลด Shapefile ทุกไฟล์ขึ้น Supabase Storage
+    คืน URLs ของทุกส่วน + geojson_url
+    """
+    safe_prefix = prefix.replace("/", "_").replace(" ", "_")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        shp_path = await assemble_shapefile(
+            tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
+        )
+
+        # วิเคราะห์ GIS ก่อน upload
+        gis = extract_gis_from_shp(shp_path)
+
+        urls = {}
+        parts = {
+            ".shp": shp_file,
+            ".dbf": dbf_file,
+            ".shx": shx_file,
+        }
+        if prj_file and prj_file.filename:
+            parts[".prj"] = prj_file
+        if cpg_file and cpg_file.filename:
+            parts[".cpg"] = cpg_file
+
+        # Upload แต่ละส่วน
+        for ext, upload in parts.items():
+            storage_path = f"{safe_prefix}{ext}"
+            local_path   = os.path.join(tmp, f"input{ext}")
+            ct = SHP_CONTENT_TYPES.get(ext, "application/octet-stream")
+            try:
+                url = upload_to_storage(db, "dnp-shapefiles", storage_path, local_path, ct)
+                urls[ext.lstrip(".")] = url
+            except Exception as e:
+                log.warning(f"Upload {ext} failed: {e}")
+
+        # Upload GeoJSON
+        geojson_path = os.path.join(tmp, f"{safe_prefix}_map.json")
+        with open(geojson_path, "w", encoding="utf-8") as jf:
+            jf.write(gis["gdf84"].to_json())
+        try:
+            geojson_url = upload_to_storage(
+                db, "dnp-shapefiles", f"{safe_prefix}_map.json", geojson_path, "application/json"
+            )
+            urls["geojson"] = geojson_url
+        except Exception as e:
+            log.warning(f"GeoJSON upload failed: {e}")
+            geojson_url = ""
+
+    return {
+        "success":      True,
+        "lat":          gis["lat"],
+        "lon":          gis["lon"],
+        "rai":          gis["rai"],
+        "ngarn":        gis["ngarn"],
+        "wa":           gis["wa"],
+        "utm_zone":     gis["utm_zone"],
+        "utm_easting":  gis["utm_easting"],
+        "utm_northing": gis["utm_northing"],
+        "urls":         urls,
+        "geojson_url":  geojson_url,
+        "shp_url":      urls.get("shp", ""),
+    }
+
+# ── บันทึกคดีบุกรุก / ไม้ (แยกไฟล์) ──────────────────────────────────────
 @app.post("/process-shapefile/", tags=["Cases"])
 async def process_shapefile(
-    file:           UploadFile = File(...),
-    pdf_file:       UploadFile = File(None),
+    shp_file:       UploadFile = File(..., description="ไฟล์ .shp"),
+    dbf_file:       UploadFile = File(..., description="ไฟล์ .dbf"),
+    shx_file:       UploadFile = File(..., description="ไฟล์ .shx"),
+    prj_file:       Optional[UploadFile] = File(None),
+    cpg_file:       Optional[UploadFile] = File(None),
+    pdf_file:       Optional[UploadFile] = File(None),
     case_type:      str   = Form(...),
     complaint_no:   str   = Form(""),
     criminal_no:    str   = Form(""),
@@ -612,7 +669,7 @@ async def process_shapefile(
     db: Client = Depends(get_db),
 ):
     get_table(case_type)
-    zip_content = await validate_file(file, "zip")
+
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
 
@@ -625,10 +682,13 @@ async def process_shapefile(
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            zip_path = os.path.join(tmp, "upload.zip")
-            with open(zip_path, "wb") as buf:
-                buf.write(zip_content)
-            gis = extract_gis(zip_path, os.path.join(tmp, "ex"))
+            # ── Assemble shapefile ────────────────────────────────────────────
+            shp_path = await assemble_shapefile(
+                tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
+            )
+
+            # ── วิเคราะห์ GIS ─────────────────────────────────────────────────
+            gis = extract_gis_from_shp(shp_path)
 
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
@@ -638,12 +698,31 @@ async def process_shapefile(
             f_wa       = int(round(wa)) if wa    > 0 else gis["wa"]
             coords     = [gis["lat"], gis["lon"]]
 
-            clean_shp = f"{safe_key}_{file.filename.replace(' ', '_')}"
-            try:
-                shp_url = upload_to_storage(db, "dnp-shapefiles", clean_shp, zip_path)
-            except Exception as e:
-                return JSONResponse({"success": False, "error": f"อัปโหลด Shapefile ล้มเหลว: {e}"})
+            # ── Upload Shapefile parts ────────────────────────────────────────
+            shp_url = ""
+            part_files = {
+                ".shp": os.path.join(tmp, "input.shp"),
+                ".dbf": os.path.join(tmp, "input.dbf"),
+                ".shx": os.path.join(tmp, "input.shx"),
+            }
+            if os.path.exists(os.path.join(tmp, "input.prj")):
+                part_files[".prj"] = os.path.join(tmp, "input.prj")
+            if os.path.exists(os.path.join(tmp, "input.cpg")):
+                part_files[".cpg"] = os.path.join(tmp, "input.cpg")
 
+            for ext, local_path in part_files.items():
+                storage_path = f"{safe_key}{ext}"
+                ct = SHP_CONTENT_TYPES.get(ext, "application/octet-stream")
+                try:
+                    url = upload_to_storage(db, "dnp-shapefiles", storage_path, local_path, ct)
+                    if ext == ".shp":
+                        shp_url = url   # ใช้ .shp URL เป็น shapefile_url หลัก
+                except Exception as e:
+                    log.warning(f"Upload {ext} failed: {e}")
+                    if ext == ".shp":
+                        return JSONResponse({"success": False, "error": f"อัปโหลด .shp ล้มเหลว: {e}"})
+
+            # ── Upload PDF ────────────────────────────────────────────────────
             pdf_url = ""
             if pdf_file and pdf_file.filename:
                 pdf_fn  = f"{safe_key}_{pdf_file.filename.replace(' ', '_')}"
@@ -655,6 +734,7 @@ async def process_shapefile(
                 except Exception as e:
                     log.warning(f"PDF upload failed: {e}")
 
+            # ── สร้าง + Upload GeoJSON ─────────────────────────────────────────
             geojson_fn   = f"{safe_key}_map.json"
             geojson_path = os.path.join(tmp, geojson_fn)
             with open(geojson_path, "w", encoding="utf-8") as jf:
@@ -668,6 +748,7 @@ async def process_shapefile(
 
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
 
+            # ── Insert DB ─────────────────────────────────────────────────────
             try:
                 if case_type == "encroachment":
                     row: dict = {
@@ -682,7 +763,7 @@ async def process_shapefile(
                         "coords":         coords,
                         "agency":         agency,
                         "suspects_count": suspects_count,
-                        "shapefile_url":  shp_url,
+                        "shapefile_url":  shp_url,   # URL ของ .shp
                         "pdf_url":        pdf_url,
                         "geojson_data":   geojson_url,
                         "utm_zone":       f_zone,
@@ -748,7 +829,7 @@ async def process_shapefile(
         log.exception("process_shapefile error")
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── บันทึกคดีสัตว์ป่า ───────────────────────────
+# ── บันทึกคดีสัตว์ป่า (ไม่เปลี่ยน — ไม่มี shapefile) ──────────────────────
 @app.post("/process-wildlife/", tags=["Cases"])
 async def process_wildlife(
     pdf_file:       UploadFile = File(None),
@@ -823,7 +904,7 @@ async def process_wildlife(
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── ดึงรายการคดี ─────────────────────────────────
+# ── ดึงรายการคดี ──────────────────────────────────────────────────────────
 @app.get("/get-cases/{case_type}", tags=["Cases"])
 async def get_cases(
     case_type: str,
@@ -851,7 +932,7 @@ async def get_cases(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# ── ลบคดี ────────────────────────────────────────
+# ── ลบคดี ─────────────────────────────────────────────────────────────────
 @app.delete("/delete-case/{case_type}/{case_no}", tags=["Cases"])
 async def delete_case(
     case_type: str,
@@ -865,7 +946,7 @@ async def delete_case(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# ── UTM Converter endpoint ────────────────────────
+# ── UTM Converter endpoint ────────────────────────────────────────────────
 @app.get("/convert-utm", tags=["Utils"])
 def convert_utm_api(
     zone:     int   = Query(47),
@@ -879,7 +960,7 @@ def convert_utm_api(
     except Exception as e:
         raise HTTPException(400, f"แปลงพิกัดไม่ได้: {e}")
 
-# ── Reload schema cache ───────────────────────────
+# ── Reload schema cache ───────────────────────────────────────────────────
 @app.post("/reload-schema/", tags=["Admin"])
 async def reload_schema(db: Client = Depends(get_db)):
     clear_schema_cache()
@@ -889,215 +970,61 @@ async def reload_schema(db: Client = Depends(get_db)):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-# ─────────────────────────────────────────────────
-# 11. DEBUG ENDPOINTS
-# ─────────────────────────────────────────────────
-
-@app.post("/debug-zip/", tags=["Debug"])
-async def debug_zip(file: UploadFile = File(...)):
-    """ตรวจสอบโครงสร้างไฟล์ ZIP + Shapefile โดยละเอียด"""
-    result = {}
-    try:
-        content = await file.read()
-        result["file_size_kb"] = round(len(content) / 1024, 1)
-        result["filename"]     = file.filename
-
-        with tempfile.TemporaryDirectory() as tmp:
-            zip_path = os.path.join(tmp, "upload.zip")
-            with open(zip_path, "wb") as f:
-                f.write(content)
-
-            with zipfile.ZipFile(zip_path) as z:
-                result["zip_contents"] = z.namelist()
-
-            ex_dir = os.path.join(tmp, "ex")
-            os.makedirs(ex_dir)
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(ex_dir)
-
-            shp_files  = glob.glob(os.path.join(ex_dir, "**", "*.shp"), recursive=True)
-            shp_files += glob.glob(os.path.join(ex_dir, "**", "*.SHP"), recursive=True)
-            result["shp_found"] = shp_files
-
-            if shp_files:
-                gdf = gpd.read_file(shp_files[0])
-                result["gdf_columns"]      = list(gdf.columns)
-                result["gdf_dtypes"]       = {c: str(gdf[c].dtype) for c in gdf.columns}
-                result["gdf_crs"]          = str(gdf.crs)
-                result["gdf_empty"]        = gdf.empty
-                result["gdf_len"]          = len(gdf)
-                result["geometry_col"]     = gdf.geometry.name if not gdf.empty else "N/A"
-                if not gdf.empty:
-                    result["first_geom_type"]  = str(type(gdf.iloc[0].geometry).__name__) if gdf.iloc[0].geometry else "None"
-                    result["geom_null_count"]  = int(gdf.geometry.isna().sum())
-
-        result["success"] = True
-    except Exception as e:
-        result["success"]   = False
-        result["error"]     = str(e)
-        result["traceback"] = traceback.format_exc()
-    return result
-
-
-@app.post("/debug-multipolygon/", tags=["Debug"])
-async def debug_multipolygon(file: UploadFile = File(...)):
-    """
-    Debug MultiPolygon แบบละเอียดทีละขั้น
-    ตรวจสอบว่า fiona อ่าน geometry ได้ถูกต้องหรือไม่
-    เปรียบเทียบ feat.geometry vs feat["geometry"] (fiona 1.9+)
-    """
-    import fiona
-    from shapely.geometry import shape
-    from shapely.validation import make_valid
-
+# ── Debug endpoint ────────────────────────────────────────────────────────
+@app.post("/debug-shp/", tags=["Debug"])
+async def debug_shp(
+    shp_file: UploadFile = File(...),
+    dbf_file: UploadFile = File(...),
+    shx_file: UploadFile = File(...),
+    prj_file: Optional[UploadFile] = File(None),
+    cpg_file: Optional[UploadFile] = File(None),
+):
+    """ตรวจสอบ Shapefile แยกไฟล์แบบละเอียด"""
     result: dict = {}
     try:
-        content = await file.read()
-        result["file_size_kb"] = round(len(content) / 1024, 1)
-        result["filename"]     = file.filename
-
         with tempfile.TemporaryDirectory() as tmp:
-            zip_path = os.path.join(tmp, "up.zip")
-            with open(zip_path, "wb") as f:
-                f.write(content)
+            shp_path = await assemble_shapefile(
+                tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
+            )
+            result["shp_path"]    = shp_path
+            result["files_found"] = os.listdir(tmp)
 
-            with zipfile.ZipFile(zip_path) as z:
-                result["zip_contents"] = z.namelist()
-
-            ex = os.path.join(tmp, "ex")
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(ex)
-
-            shps  = glob.glob(os.path.join(ex, "**", "*.shp"), recursive=True)
-            shps += glob.glob(os.path.join(ex, "**", "*.SHP"), recursive=True)
-            result["shp_found"] = shps
-
-            if not shps:
-                result["success"] = False
-                result["error"]   = "ไม่พบไฟล์ .shp ใน ZIP"
-                return result
-
-            shp = shps[0]
-            result["shp_path"] = shp
-
-            # ── ทดสอบ fiona โดยตรง ────────────────────────────
-            fiona_result = {}
             try:
-                with fiona.open(shp, encoding="utf-8") as src:
-                    fiona_result["driver"]        = src.driver
-                    fiona_result["crs"]           = str(src.crs)
-                    fiona_result["crs_wkt"]       = src.crs_wkt[:120] if src.crs_wkt else None
-                    fiona_result["schema"]        = str(src.schema)
-                    fiona_result["feature_count"] = len(src)
-                    fiona_result["fiona_version"] = fiona.__version__
+                gdf = gpd.read_file(shp_path)
+                result["gdf_len"]         = len(gdf)
+                result["gdf_crs"]         = str(gdf.crs)
+                result["gdf_columns"]     = list(gdf.columns)
+                result["geom_null_count"] = int(gdf.geometry.isna().sum())
+                if len(gdf) and not gdf.geometry.isna().all():
+                    gdf84 = gdf.to_crs(epsg=4326)
+                    c = gdf84.geometry.centroid.iloc[0]
+                    result["centroid_lat"] = round(float(c.y), 6)
+                    result["centroid_lon"] = round(float(c.x), 6)
+            except Exception as eg:
+                result["gpd_error"] = str(eg)
 
-                    if len(src) == 0:
-                        fiona_result["warning"] = "ไม่มี feature ในไฟล์"
-                    else:
-                        feat = next(iter(src))
-                        fiona_result["feat_keys"] = list(feat.keys())
-
-                        geom_bracket = feat["geometry"] if "geometry" in feat else "KEY_NOT_FOUND"
-                        geom_attr    = getattr(feat, "geometry", "ATTR_NOT_FOUND")
-
-                        fiona_result["geom_via_bracket_type"]    = type(geom_bracket).__name__
-                        fiona_result["geom_via_bracket_is_none"] = geom_bracket is None
-                        fiona_result["geom_via_attr_type"]       = type(geom_attr).__name__
-                        fiona_result["geom_via_attr_is_none"]    = geom_attr is None
-
-                        if geom_bracket and hasattr(geom_bracket, "get"):
-                            fiona_result["geom_type_field"]    = geom_bracket.get("type")
-                            coord_sample = geom_bracket.get("coordinates")
-                            if coord_sample:
-                                fiona_result["geom_coord_sample"] = str(coord_sample)[:300]
-                        elif isinstance(geom_bracket, str):
-                            fiona_result["geom_bracket_str"] = geom_bracket
-
-                        shapely_result = {}
-                        raw = geom_bracket if geom_bracket is not None else geom_attr
-                        if raw is not None:
-                            try:
-                                shp_geom = shape(raw)
-                                shapely_result["geom_type"]  = shp_geom.geom_type
-                                shapely_result["is_valid"]   = shp_geom.is_valid
-                                shapely_result["is_empty"]   = shp_geom.is_empty
-                                shapely_result["area_deg2"]  = shp_geom.area
-                                if not shp_geom.is_valid:
-                                    fixed = make_valid(shp_geom)
-                                    shapely_result["make_valid_type"]  = fixed.geom_type
-                                    shapely_result["make_valid_valid"] = fixed.is_valid
-                            except Exception as e_shp:
-                                shapely_result["error"]     = str(e_shp)
-                                shapely_result["traceback"] = traceback.format_exc()
-                        else:
-                            shapely_result["error"] = "ไม่ได้ geometry จากทั้ง 2 วิธี"
-
-                        fiona_result["shapely_test"] = shapely_result
-
-            except Exception as e_fiona:
-                fiona_result["error"]     = str(e_fiona)
-                fiona_result["traceback"] = traceback.format_exc()
-
-            result["fiona"] = fiona_result
-
-            # ── ทดสอบ geopandas อ่านตรง ──────────────────────
-            gpd_result = {}
             try:
-                gdf = gpd.read_file(shp)
-                gpd_result["len"]             = len(gdf)
-                gpd_result["columns"]         = list(gdf.columns)
-                gpd_result["geometry_col"]    = gdf.geometry.name
-                gpd_result["crs"]             = str(gdf.crs)
-                gpd_result["geom_null_count"] = int(gdf.geometry.isna().sum())
-                if len(gdf):
-                    g0 = gdf.iloc[0].geometry
-                    gpd_result["first_geom_type"]  = str(type(g0).__name__) if g0 else "None"
-                    gpd_result["first_geom_valid"] = bool(g0.is_valid) if g0 else False
-                    gpd_result["first_geom_empty"] = bool(g0.is_empty) if g0 else True
-                    try:
-                        gdf84 = gdf.to_crs(epsg=4326)
-                        c = gdf84.geometry.centroid.iloc[0]
-                        gpd_result["centroid_lat"] = round(float(c.y), 6)
-                        gpd_result["centroid_lon"] = round(float(c.x), 6)
-                    except Exception as e_crs:
-                        gpd_result["to_crs_error"] = str(e_crs)
-            except Exception as e_gpd:
-                gpd_result["error"]     = str(e_gpd)
-                gpd_result["traceback"] = traceback.format_exc()
-
-            result["geopandas"] = gpd_result
-
-            # ── ทดสอบ extract_gis (pipeline จริง) ────────────
-            pipeline_result = {}
-            try:
-                gis = extract_gis(zip_path, os.path.join(tmp, "pipeline_ex"))
-                pipeline_result["success"]      = True
-                pipeline_result["lat"]          = gis["lat"]
-                pipeline_result["lon"]          = gis["lon"]
-                pipeline_result["rai"]          = gis["rai"]
-                pipeline_result["ngarn"]        = gis["ngarn"]
-                pipeline_result["wa"]           = gis["wa"]
-                pipeline_result["utm_zone"]     = gis["utm_zone"]
-                pipeline_result["utm_easting"]  = gis["utm_easting"]
-                pipeline_result["utm_northing"] = gis["utm_northing"]
-                pipeline_result["gdf_len"]      = len(gis["gdf84"])
-            except HTTPException as e_http:
-                pipeline_result["success"] = False
-                pipeline_result["error"]   = e_http.detail
-            except Exception as e_pipe:
-                pipeline_result["success"]   = False
-                pipeline_result["error"]     = str(e_pipe)
-                pipeline_result["traceback"] = traceback.format_exc()
-
-            result["pipeline"] = pipeline_result
+                pipeline = extract_gis_from_shp(shp_path)
+                result["pipeline"] = {
+                    "lat":          pipeline["lat"],
+                    "lon":          pipeline["lon"],
+                    "rai":          pipeline["rai"],
+                    "ngarn":        pipeline["ngarn"],
+                    "wa":           pipeline["wa"],
+                    "utm_zone":     pipeline["utm_zone"],
+                    "utm_easting":  pipeline["utm_easting"],
+                    "utm_northing": pipeline["utm_northing"],
+                    "gdf_len":      len(pipeline["gdf84"]),
+                }
+            except Exception as ep:
+                result["pipeline_error"]     = str(ep)
+                result["pipeline_traceback"] = traceback.format_exc()
 
         result["success"] = True
-
     except Exception as e:
         result["success"]   = False
         result["error"]     = str(e)
         result["traceback"] = traceback.format_exc()
-
     return result
 
 # ─────────────────────────────────────────────────
