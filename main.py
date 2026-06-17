@@ -343,32 +343,53 @@ def _read_shp_via_fiona(shp_path: str):
 
     crs_set = False
     if crs_wkt:
-        for method, fn in [
-            ("from_wkt(str)", lambda: ProjCRS.from_wkt(crs_wkt)),
-            ("from_wkt(bytes)", lambda: ProjCRS.from_wkt(crs_wkt.encode("utf-8") if isinstance(crs_wkt, str) else crs_wkt)),
-            ("from_user_input", lambda: ProjCRS.from_user_input(crs_wkt)),
-        ]:
-            if crs_set:
-                break
+        # บาง build ของ fiona/GDAL คืน crs_wkt เป็น bytes แทน str — แปลงให้เป็น str
+        # ก่อนเสมอ ไม่งั้น regex และ pyproj parsing จะพังแบบงงๆ (type mismatch)
+        if isinstance(crs_wkt, bytes):
             try:
-                gdf = gdf.set_crs(fn(), allow_override=True)
-                crs_set = True
-                log.info(f"[GIS] CRS: {method} ok")
-            except Exception as e:
-                log.warning(f"[GIS] {method} failed: {e}")
+                crs_wkt_str = crs_wkt.decode("utf-8", errors="ignore")
+            except Exception:
+                crs_wkt_str = crs_wkt.decode("latin-1", errors="ignore")
+        else:
+            crs_wkt_str = str(crs_wkt)
 
-        if not crs_set:
-            m = re.search(r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"', crs_wkt, re.IGNORECASE)
+        # 1) ลองดึง EPSG code จากข้อความ WKT ตรงๆ ก่อน — เร็วกว่าและไม่ผ่าน
+        #    pyproj parser เลย จึงเลี่ยงปัญหา str/bytes signature ที่ pyproj
+        #    บางเวอร์ชัน/บาง build ของ PROJ มีปัญหาด้วย
+        try:
+            m = re.search(r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"', crs_wkt_str, re.IGNORECASE)
             if not m:
-                m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt, re.IGNORECASE)
+                m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt_str, re.IGNORECASE)
             if m:
                 gdf = gdf.set_crs(epsg=int(m.group(1)), allow_override=True)
                 crs_set = True
                 log.info(f"[GIS] CRS: parsed EPSG:{m.group(1)}")
+        except Exception as e:
+            log.warning(f"[GIS] EPSG regex parse failed: {e}")
+
+        # 2) ถ้า regex หา EPSG ไม่เจอ ค่อย fallback ไปลอง parse WKT เต็มรูปแบบ
+        #    ด้วย pyproj (เฉพาะ str เท่านั้น — ไม่ลอง bytes เพราะ pyproj ต้องการ
+        #    str และการ encode เป็น bytes คือสาเหตุของ error ที่เคยเจอ)
+        if not crs_set:
+            for method, fn in [
+                ("from_wkt(str)", lambda: ProjCRS.from_wkt(crs_wkt_str)),
+                ("from_user_input", lambda: ProjCRS.from_user_input(crs_wkt_str)),
+            ]:
+                if crs_set:
+                    break
+                try:
+                    gdf = gdf.set_crs(fn(), allow_override=True)
+                    crs_set = True
+                    log.info(f"[GIS] CRS: {method} ok")
+                except Exception as e:
+                    log.warning(f"[GIS] {method} failed: {e}")
 
     if not crs_set:
         log.warning("[GIS] CRS ไม่สามารถตั้งได้ — ใช้ EPSG:32647")
-        gdf = gdf.set_crs(epsg=32647, allow_override=True)
+        try:
+            gdf = gdf.set_crs(epsg=32647, allow_override=True)
+        except Exception as e:
+            log.error(f"[GIS] EPSG:32647 fallback ก็ล้มเหลว: {e}")
 
     return gdf
 
@@ -411,7 +432,8 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         except HTTPException:
             raise
         except Exception as e:
-            err_msg = str(last_err) if last_err else str(e)
+            err_msg = str(e)
+            log.error(f"[GIS] _read_shp_via_fiona raised: {err_msg} (earlier gpd.read_file error: {last_err})")
             if "without a geometry column" in err_msg:
                 raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry ว่างเปล่า)")
             raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {err_msg}")
