@@ -398,7 +398,13 @@ def extract_gis_from_shp(shp_path: str) -> dict:
             log.warning(f"[GIS] gpd.read_file({enc}) error: {e}")
             gdf = None
 
-    if gdf is None or gdf.empty or not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
+    if (
+        gdf is None
+        or gdf.empty
+        or not hasattr(gdf, "geometry")
+        or gdf.geometry.isna().all()
+        or gdf.geometry.is_empty.all()
+    ):
         log.warning("[GIS] gpd fallback → fiona manual read")
         try:
             gdf = _read_shp_via_fiona(shp_path)
@@ -412,13 +418,23 @@ def extract_gis_from_shp(shp_path: str) -> dict:
 
     if gdf is None or gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
-    if not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
+    if (
+        not hasattr(gdf, "geometry")
+        or gdf.geometry.isna().all()
+        or gdf.geometry.is_empty.all()
+    ):
         raise HTTPException(400, "Shapefile มีข้อมูลแต่โครงสร้างรูปแปลงว่างเปล่าทั้งหมด")
     if getattr(gdf, "_geometry_column_name", None) is None:
         if "geometry" in gdf.columns:
             gdf = gdf.set_geometry("geometry")
         else:
             raise HTTPException(400, "ไฟล์ Shapefile ชำรุด (ไม่พบคอลัมน์รูปแปลง)")
+
+    gdf = gdf[gdf.geometry.notnull()]
+    gdf = gdf[~gdf.geometry.is_empty]
+
+    if gdf.empty:
+        raise HTTPException(400, "ไม่มี geometry ที่ใช้งานได้")
 
     if gdf.crs is None:
         log.warning("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
