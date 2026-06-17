@@ -717,7 +717,7 @@ def upload_to_storage(
             file=f,
             file_options={
                 "cache-control": "3600",
-                "upsert": True,
+                "upsert": "true",
                 "content-type": content_type,
             },
         )
@@ -735,7 +735,7 @@ def upload_bytes_to_storage(
         file=data,
         file_options={
             "cache-control": "3600",
-            "upsert": True,
+            "upsert": "true",
             "content-type": content_type,
         },
     )
