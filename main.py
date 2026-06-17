@@ -16,6 +16,12 @@ DNP GIS Case API — Production v5.1
    - endpoint /analyze-shapefile/ /process-shapefile/ /process-wildlife/
    - endpoint /upload-shp-parts/
    - ฟิลด์ complaint_no, criminal_no, seizure_no
+
+🐛 BugFix (patch):
+   - แก้ 'bool' object has no attribute 'encode'
+     → แปลง bool columns → int ใน extract_gis_from_shp ก่อน return gdf84
+   - แก้ CRS 'expected bytes, str found'
+     → ใช้ CRS.from_epsg() เป็น fallback แทนการส่ง string เข้า set_crs โดยตรง
 """
 
 import os, shutil, tempfile, json, math, time, logging, glob, traceback, re, zipfile
@@ -254,6 +260,53 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
 # ─────────────────────────────────────────────────
 # 9. GIS EXTRACTION
 # ─────────────────────────────────────────────────
+def _safe_set_crs(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
+    """
+    🐛 FIX: set_crs ด้วย epsg= parameter แทน string
+    บาง build ของ pyproj/PROJ ต้องการ CRS object ไม่ใช่ string
+    ลอง 3 วิธีเรียงตามความปลอดภัย
+    """
+    # วิธี 1: epsg= parameter (แนะนำ — ไม่ผ่าน string ให้ pyproj เลย)
+    try:
+        return gdf.set_crs(epsg=epsg, allow_override=True)
+    except Exception as e1:
+        log.warning(f"[GIS] set_crs(epsg={epsg}) failed: {e1}")
+
+    # วิธี 2: CRS.from_epsg object
+    try:
+        from pyproj import CRS as ProjCRS
+        return gdf.set_crs(ProjCRS.from_epsg(epsg), allow_override=True)
+    except Exception as e2:
+        log.warning(f"[GIS] set_crs(CRS.from_epsg({epsg})) failed: {e2}")
+
+    # วิธี 3: กำหนด .crs โดยตรง (last resort)
+    try:
+        from pyproj import CRS as ProjCRS
+        gdf = gdf.copy()
+        gdf.crs = ProjCRS.from_epsg(epsg)
+        return gdf
+    except Exception as e3:
+        log.error(f"[GIS] set_crs fallback ทั้งหมดล้มเหลว: {e3}")
+        return gdf
+
+
+def _fix_bool_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    🐛 FIX: แปลง bool dtype → int
+    Supabase storage SDK และ fiona/shapefile writer ไม่รองรับ bool
+    ทำให้เกิด 'bool' object has no attribute 'encode'
+    """
+    try:
+        bool_cols = gdf.select_dtypes(include="bool").columns.tolist()
+        if bool_cols:
+            log.info(f"[GIS] แปลง bool → int columns: {bool_cols}")
+            gdf = gdf.copy()
+            gdf[bool_cols] = gdf[bool_cols].astype(int)
+    except Exception as e:
+        log.warning(f"[GIS] _fix_bool_columns error: {e}")
+    return gdf
+
+
 def _read_shp_via_fiona(shp_path: str):
     import fiona
     import geopandas as gpd
@@ -361,9 +414,10 @@ def _read_shp_via_fiona(shp_path: str):
             if not m:
                 m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt_str, re.IGNORECASE)
             if m:
-                gdf = gdf.set_crs(epsg=int(m.group(1)), allow_override=True)
+                epsg_code = int(m.group(1))
+                gdf = _safe_set_crs(gdf, epsg_code)  # 🐛 FIX: ใช้ _safe_set_crs
                 crs_set = True
-                log.info(f"[GIS] CRS: parsed EPSG:{m.group(1)}")
+                log.info(f"[GIS] CRS: parsed EPSG:{epsg_code}")
         except Exception as e:
             log.warning(f"[GIS] EPSG regex parse failed: {e}")
 
@@ -386,10 +440,7 @@ def _read_shp_via_fiona(shp_path: str):
 
     if not crs_set:
         log.warning("[GIS] CRS ไม่สามารถตั้งได้ — ใช้ EPSG:32647")
-        try:
-            gdf = gdf.set_crs(epsg=32647, allow_override=True)
-        except Exception as e:
-            log.error(f"[GIS] EPSG:32647 fallback ก็ล้มเหลว: {e}")
+        gdf = _safe_set_crs(gdf, 32647)  # 🐛 FIX: ใช้ _safe_set_crs แทน set_crs โดยตรง
 
     return gdf
 
@@ -458,12 +509,10 @@ def extract_gis_from_shp(shp_path: str) -> dict:
     if gdf.empty:
         raise HTTPException(400, "ไม่มี geometry ที่ใช้งานได้")
 
+    # 🐛 FIX: ใช้ _safe_set_crs แทน set_crs โดยตรง เพื่อรองรับ pyproj ทุกเวอร์ชัน
     if gdf.crs is None:
         log.warning("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
-        try:
-            gdf = gdf.set_crs(epsg=32647, allow_override=True)
-        except Exception as e:
-            log.warning(f"[GIS] set_crs fallback error: {e}")
+        gdf = _safe_set_crs(gdf, 32647)
 
     try:
         gdf84 = gdf.to_crs(epsg=4326)
@@ -488,6 +537,11 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
         pass
+
+    # 🐛 FIX: แปลง bool → int ก่อน return
+    # ป้องกัน 'bool' object has no attribute 'encode'
+    # ที่เกิดเมื่อ Supabase SDK / fiona พยายาม serialize ค่า bool เป็น string
+    gdf84 = _fix_bool_columns(gdf84)
 
     utm = latlon_to_utm(lat, lon)
     return {
