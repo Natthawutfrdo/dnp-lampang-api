@@ -1,16 +1,21 @@
 """
-DNP GIS Case API — Production v5.0
+DNP GIS Case API — Production v5.1
 ระบบ API สารบบคดีเชิงพื้นที่ สบอ.13 ลำปาง
 
-🔧 v5.0 REFACTOR: รับไฟล์ Shapefile แยกส่วน (.shp .dbf .shx .prj ฯลฯ)
-   แทนการส่งเป็น ZIP เดียว
-   - endpoint /analyze-shapefile/ รับ: shp_file, dbf_file, shx_file, prj_file (optional)
-   - endpoint /process-shapefile/ รับ: shp_file, dbf_file, shx_file, prj_file, pdf_file
-   - ไม่มีการเปลี่ยน DB schema — backward compatible กับข้อมูลเดิมทั้งหมด
-   - shapefile_url จะเป็น URL ของ .shp ไฟล์ (แทน .zip)
-   - เพิ่ม endpoint /upload-shp-parts/ สำหรับ upload แยก แล้วคืน URLs ทุกไฟล์
+🆕 v5.1:
+   - เพิ่มตาราง suspects (ผู้ต้องหา) รองรับสูงสุด 5 คนต่อคดี
+   - เพิ่มตาราง exhibits (ของกลาง) รองรับสูงสุด 10 รายการต่อคดี
+   - เพิ่ม endpoint /save-suspects/ /save-exhibits/
+   - เพิ่ม endpoint /get-suspects/ /get-exhibits/
+   - เพิ่ม endpoint /upload-suspect-photo/ สำหรับอัปโหลดรูปผู้ต้องหา
+   - process-shapefile/ และ process-wildlife/ คืน case_id กลับมา
+   - ลบ suspect_count ออกจาก payload (คำนวณจาก suspects table แทน)
 
-🆕 v5.0.1: เพิ่มฟิลด์ complaint_no, criminal_no, seizure_no ในตาราง wildlife_cases
+🔧 v5.0 (เดิม):
+   - รับไฟล์ Shapefile แยกส่วน (.shp .dbf .shx .prj ฯลฯ)
+   - endpoint /analyze-shapefile/ /process-shapefile/ /process-wildlife/
+   - endpoint /upload-shp-parts/
+   - ฟิลด์ complaint_no, criminal_no, seizure_no
 """
 
 import os, shutil, tempfile, json, math, time, logging, glob, traceback, re, zipfile
@@ -36,7 +41,7 @@ log = logging.getLogger(__name__)
 app = FastAPI(
     title="DNP GIS Case API",
     description="ระบบบริการข้อมูลสารบบคดีและแผนที่เชิงพื้นที่ สบอ.13 ลำปาง",
-    version="5.0.1",
+    version="5.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -146,10 +151,6 @@ async def validate_shp_parts(
     dbf_file: UploadFile,
     shx_file: UploadFile,
 ) -> dict[str, bytes]:
-    """
-    ตรวจสอบและอ่าน bytes ของไฟล์ Shapefile แยกส่วน
-    บังคับ: .shp .dbf .shx  |  optional: .prj .cpg
-    """
     errors = []
     if not shp_file or not shp_file.filename.lower().endswith(".shp"):
         errors.append("ต้องแนบไฟล์ .shp")
@@ -167,7 +168,7 @@ async def validate_shp_parts(
     return result
 
 # ─────────────────────────────────────────────────
-# 7. SHAPEFILE ASSEMBLY — เขียนลง tmpdir แล้วคืน path
+# 7. SHAPEFILE ASSEMBLY
 # ─────────────────────────────────────────────────
 async def assemble_shapefile(
     tmpdir: str,
@@ -384,11 +385,8 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         try:
             _tmp = gpd.read_file(shp_path, encoding=enc)
             if _tmp is not None and len(_tmp) > 0:
-                # บังคับ Set Geometry กรณีที่มีคอลัมน์ geometry แต่อาจหลุดการเชื่อมต่อ
                 if "geometry" in _tmp.columns and getattr(_tmp, "_geometry_column_name", None) is None:
                     _tmp = _tmp.set_geometry("geometry")
-
-                # เช็คให้ชัวร์ว่ามี Property geometry และไม่เป็น Null ทั้งหมด
                 if hasattr(_tmp, "geometry") and not _tmp.geometry.isna().all():
                     gdf = _tmp
                     log.info(f"[GIS] gpd.read_file ok: encoding={enc}, rows={len(gdf)}")
@@ -400,7 +398,6 @@ def extract_gis_from_shp(shp_path: str) -> dict:
             log.warning(f"[GIS] gpd.read_file({enc}) error: {e}")
             gdf = None
 
-    # ถ้า gpd อ่านไม่ได้ หรืออ่านได้แต่ไม่มี Geometry ให้ลองใช้ fiona
     if gdf is None or gdf.empty or not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
         log.warning("[GIS] gpd fallback → fiona manual read")
         try:
@@ -409,12 +406,10 @@ def extract_gis_from_shp(shp_path: str) -> dict:
             raise
         except Exception as e:
             err_msg = str(last_err) if last_err else str(e)
-            # ดักจับ Error ที่เกิดจากการพยายามโยน CRS ใส่ DataFrame ที่ไม่มี Geometry
             if "without a geometry column" in err_msg:
-                raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry ว่างเปล่า) หรืออัปโหลดไฟล์ชุด .shp / .shx ไม่สัมพันธ์กัน")
+                raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry ว่างเปล่า)")
             raise HTTPException(400, f"เปิด Shapefile ไม่ได้: {err_msg}")
 
-    # ด่านสุดท้าย ตรวจสอบโครงสร้างก่อนนำไปประมวลผล
     if gdf is None or gdf.empty:
         raise HTTPException(400, "Shapefile ไม่มีข้อมูล (0 features)")
     if not hasattr(gdf, "geometry") or gdf.geometry.isna().all():
@@ -514,17 +509,26 @@ SHP_CONTENT_TYPES = {
     ".sbx": "application/octet-stream",
 }
 
+IMAGE_CONTENT_TYPES = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".webp": "image/webp",
+    ".gif":  "image/gif",
+}
+
 # ─────────────────────────────────────────────────
-# 11. ENDPOINTS
+# 11. ENDPOINTS — HEALTH
 # ─────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "message": "DNP GIS Case API v5.0.1 is running!",
+        "message": "DNP GIS Case API v5.1.0 is running!",
         "status": "ok",
-        "version": "5.0.1",
+        "version": "5.1.0",
         "upload_mode": "separate_files (.shp .dbf .shx .prj)",
+        "features": ["suspects", "exhibits", "photo_upload"],
     }
 
 @app.get("/health", tags=["Health"])
@@ -533,10 +537,13 @@ def health():
         "api": "ok",
         "db": "connected" if supabase else "disconnected",
         "cors_origins": ALLOWED_ORIGINS,
-        "version": "5.0.1",
+        "version": "5.1.0",
     }
 
-# ── วิเคราะห์ Shapefile ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# 12. GIS ENDPOINTS
+# ─────────────────────────────────────────────────
+
 @app.post("/analyze-shapefile/", tags=["GIS"])
 async def analyze_shapefile(
     shp_file: UploadFile = File(..., description="ไฟล์ .shp"),
@@ -563,7 +570,6 @@ async def analyze_shapefile(
         "utm_northing": gis["utm_northing"],
     }
 
-# ── อัปโหลด Shapefile parts ────────────────────────────────────────────────
 @app.post("/upload-shp-parts/", tags=["GIS"])
 async def upload_shp_parts(
     shp_file: UploadFile = File(...),
@@ -583,11 +589,7 @@ async def upload_shp_parts(
         gis = extract_gis_from_shp(shp_path)
 
         urls = {}
-        parts = {
-            ".shp": shp_file,
-            ".dbf": dbf_file,
-            ".shx": shx_file,
-        }
+        parts = {".shp": shp_file, ".dbf": dbf_file, ".shx": shx_file}
         if prj_file and prj_file.filename:
             parts[".prj"] = prj_file
         if cpg_file and cpg_file.filename:
@@ -630,12 +632,15 @@ async def upload_shp_parts(
         "shp_url":      urls.get("shp", ""),
     }
 
-# ── บันทึกคดีบุกรุก / ไม้ ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# 13. CASE ENDPOINTS
+# ─────────────────────────────────────────────────
+
 @app.post("/process-shapefile/", tags=["Cases"])
 async def process_shapefile(
-    shp_file:       UploadFile = File(..., description="ไฟล์ .shp"),
-    dbf_file:       UploadFile = File(..., description="ไฟล์ .dbf"),
-    shx_file:       UploadFile = File(..., description="ไฟล์ .shx"),
+    shp_file:       UploadFile = File(...),
+    dbf_file:       UploadFile = File(...),
+    shx_file:       UploadFile = File(...),
     prj_file:       Optional[UploadFile] = File(None),
     cpg_file:       Optional[UploadFile] = File(None),
     pdf_file:       Optional[UploadFile] = File(None),
@@ -670,10 +675,6 @@ async def process_shapefile(
 
     primary_key = complaint_no or criminal_no or "unknown"
     safe_key    = primary_key.replace("/", "_").replace(" ", "_")
-
-    new_cols = (case_type == "encroachment") and check_columns(
-        "encroachment_cases", ["complaint_no", "criminal_no", "seizure_no"]
-    )
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -736,79 +737,81 @@ async def process_shapefile(
                 return JSONResponse({"success": False, "error": f"สร้าง GeoJSON ล้มเหลว: {e}"})
 
             is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
+            case_id = None
 
             try:
                 if case_type == "encroachment":
                     row: dict = {
-                        "case_no":        complaint_no or criminal_no,
-                        "case_date":      case_date,
-                        "location":       location,
-                        "rai":            f_rai,
-                        "ngarn":          f_ngarn,
-                        "wa":             f_wa,
-                        "is_finished":    is_finished,
-                        "case_status":    case_status,
-                        "coords":         coords,
-                        "agency":         agency,
+                        "complaint_no":  complaint_no,
+                        "criminal_no":   criminal_no,
+                        "seizure_no":    seizure_no,
+                        "case_no":       complaint_no or criminal_no,
+                        "case_date":     case_date,
+                        "location":      location,
+                        "rai":           f_rai,
+                        "ngarn":         f_ngarn,
+                        "wa":            f_wa,
+                        "is_finished":   is_finished,
+                        "case_status":   case_status,
+                        "coords":        coords,
+                        "agency":        agency,
                         "suspects_count": suspects_count,
-                        "shapefile_url":  shp_url,
-                        "pdf_url":        pdf_url,
-                        "geojson_data":   geojson_url,
-                        "utm_zone":       f_zone,
-                        "utm_easting":    f_easting,
-                        "utm_northing":   f_northing,
+                        "shapefile_url": shp_url,
+                        "pdf_url":       pdf_url,
+                        "geojson_data":  geojson_url,
+                        "utm_zone":      f_zone,
+                        "utm_easting":   f_easting,
+                        "utm_northing":  f_northing,
                     }
-                    if new_cols:
-                        row["complaint_no"] = complaint_no
-                        row["criminal_no"]  = criminal_no
-                        row["seizure_no"]   = seizure_no
-                    else:
-                        extra = ""
-                        if complaint_no: extra += f"\n[แจ้ง: {complaint_no}]"
-                        if criminal_no:  extra += f"\n[อาญา: {criminal_no}]"
-                        if seizure_no:   extra += f"\n[ยึดทรัพย์: {seizure_no}]"
-                        if extra:
-                            row["case_status"] = case_status + extra
-                    db.table("encroachment_cases").insert(row).execute()
+                    result = db.table("encroachment_cases").insert(row).execute()
+                    if result.data:
+                        case_id = result.data[0].get("id")
 
                 elif case_type == "timber":
-                    db.table("timber_cases").insert({
-                        "case_no":        complaint_no or criminal_no,
-                        "case_date":      case_date,
-                        "location":       location,
-                        "timber_type":    timber_type,
-                        "width":          width,
-                        "length":         length,
-                        "size":           size,
-                        "vol_logs":       vol1,
-                        "vol_processed":  vol2,
-                        "is_finished":    is_finished,
-                        "case_status":    case_status,
-                        "coords":         coords,
-                        "agency":         agency,
+                    row = {
+                        "complaint_no":  complaint_no,
+                        "criminal_no":   criminal_no,
+                        "seizure_no":    seizure_no,
+                        "case_no":       complaint_no or criminal_no,
+                        "case_date":     case_date,
+                        "location":      location,
+                        "timber_type":   timber_type,
+                        "width":         width,
+                        "length":        length,
+                        "size":          size,
+                        "vol_logs":      vol1,
+                        "vol_processed": vol2,
+                        "is_finished":   is_finished,
+                        "case_status":   case_status,
+                        "coords":        coords,
+                        "agency":        agency,
                         "suspects_count": suspects_count,
-                        "shapefile_url":  shp_url,
-                        "pdf_url":        pdf_url,
-                        "geojson_data":   geojson_url,
-                        "utm_zone":       f_zone,
-                        "utm_easting":    f_easting,
-                        "utm_northing":   f_northing,
-                    }).execute()
+                        "shapefile_url": shp_url,
+                        "pdf_url":       pdf_url,
+                        "geojson_data":  geojson_url,
+                        "utm_zone":      f_zone,
+                        "utm_easting":   f_easting,
+                        "utm_northing":  f_northing,
+                    }
+                    result = db.table("timber_cases").insert(row).execute()
+                    if result.data:
+                        case_id = result.data[0].get("id")
 
             except Exception as e:
                 return JSONResponse({"success": False, "error": f"บันทึก DB ล้มเหลว: {e}"})
 
             return {
-                "success":         True,
-                "message":         "บันทึกข้อมูลสำเร็จ",
-                "coords":          coords,
-                "geojson_url":     geojson_url,
-                "shapefile_url":   shp_url,
-                "pdf_url":         pdf_url,
-                "utm_zone":        f_zone,
-                "utm_easting":     f_easting,
-                "utm_northing":    f_northing,
-                "schema_upgraded": new_cols,
+                "success":       True,
+                "message":       "บันทึกข้อมูลสำเร็จ",
+                "case_id":       case_id,
+                "case_type":     case_type,
+                "coords":        coords,
+                "geojson_url":   geojson_url,
+                "shapefile_url": shp_url,
+                "pdf_url":       pdf_url,
+                "utm_zone":      f_zone,
+                "utm_easting":   f_easting,
+                "utm_northing":  f_northing,
             }
 
     except HTTPException:
@@ -817,17 +820,14 @@ async def process_shapefile(
         log.exception("process_shapefile error")
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── บันทึกคดีสัตว์ป่า ─────────────────────────────────────────────────────
-# 🆕 v5.0.1: รับ complaint_no, criminal_no, seizure_no เพิ่ม
-#    ใช้ check_columns เพื่อ backward-compat กับ DB เดิม
-# ──────────────────────────────────────────────────────────────────────────
+
 @app.post("/process-wildlife/", tags=["Cases"])
 async def process_wildlife(
     pdf_file:       UploadFile = File(None),
     case_no:        str   = Form(...),
-    complaint_no:   str   = Form(""),      # 🆕
-    criminal_no:    str   = Form(""),      # 🆕
-    seizure_no:     str   = Form(""),      # 🆕
+    complaint_no:   str   = Form(""),
+    criminal_no:    str   = Form(""),
+    seizure_no:     str   = Form(""),
     case_date:      str   = Form(""),
     location:       str   = Form(...),
     status:         str   = Form(...),
@@ -843,7 +843,6 @@ async def process_wildlife(
     utm_northing:   int   = Form(0),
     db: Client = Depends(get_db),
 ):
-    # ── PDF upload ──────────────────────────────────────────────────────────
     pdf_url = ""
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
@@ -871,58 +870,243 @@ async def process_wildlife(
         except Exception:
             coords = [18.29, 99.50]
 
-    # ── ตรวจว่า wildlife_cases มีคอลัมน์ใหม่หรือยัง ─────────────────────
-    wl_new_cols = check_columns(
-        "wildlife_cases", ["complaint_no", "criminal_no", "seizure_no"]
-    )
-
     try:
         row: dict = {
-            "case_no":        case_no,
-            "case_date":      case_date,
-            "location":       location,
-            "wildlife_type":  wildlife_type,
-            "equipment":      equipment,
-            "is_finished":    is_finished,
-            "case_status":    case_status,
-            "coords":         coords,
-            "agency":         agency,
+            "complaint_no":  complaint_no,
+            "criminal_no":   criminal_no,
+            "seizure_no":    seizure_no,
+            "case_no":       case_no,
+            "case_date":     case_date,
+            "location":      location,
+            "wildlife_type": wildlife_type,
+            "equipment":     equipment,
+            "is_finished":   is_finished,
+            "case_status":   case_status,
+            "coords":        coords,
+            "agency":        agency,
             "suspects_count": suspects_count,
-            "pdf_url":        pdf_url,
-            "utm_zone":       f_zone,
-            "utm_easting":    f_east,
-            "utm_northing":   f_north,
+            "pdf_url":       pdf_url,
+            "utm_zone":      f_zone,
+            "utm_easting":   f_east,
+            "utm_northing":  f_north,
         }
 
-        if wl_new_cols:
-            # ── DB มีคอลัมน์ใหม่แล้ว → ใส่ตรงๆ ───────────────────────────
-            row["complaint_no"] = complaint_no
-            row["criminal_no"]  = criminal_no
-            row["seizure_no"]   = seizure_no
-        else:
-            # ── DB ยังไม่มี → ยัดไว้ใน case_status ชั่วคราว ───────────────
-            extra = ""
-            if complaint_no: extra += f"\n[แจ้ง: {complaint_no}]"
-            if criminal_no:  extra += f"\n[อาญา: {criminal_no}]"
-            if seizure_no:   extra += f"\n[ยึดทรัพย์: {seizure_no}]"
-            if extra:
-                row["case_status"] = case_status + extra
-
-        db.table("wildlife_cases").insert(row).execute()
+        result = db.table("wildlife_cases").insert(row).execute()
+        case_id = result.data[0].get("id") if result.data else None
 
         return {
-            "success":          True,
-            "message":          "บันทึกคดีสัตว์ป่าสำเร็จ",
-            "coords":           coords,
-            "utm_zone":         f_zone,
-            "utm_easting":      f_east,
-            "utm_northing":     f_north,
-            "schema_upgraded":  wl_new_cols,
+            "success":     True,
+            "message":     "บันทึกคดีสัตว์ป่าสำเร็จ",
+            "case_id":     case_id,
+            "case_type":   "wildlife",
+            "coords":      coords,
+            "utm_zone":    f_zone,
+            "utm_easting": f_east,
+            "utm_northing": f_north,
         }
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
-# ── ดึงรายการคดี ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# 14. SUSPECTS ENDPOINTS
+# ─────────────────────────────────────────────────
+
+@app.post("/save-suspects/", tags=["Suspects"])
+async def save_suspects(
+    case_type:     str = Form(...),
+    case_ref_id:   int = Form(...),
+    suspects_json: str = Form(...),
+    db: Client = Depends(get_db),
+):
+    """
+    บันทึกรายชื่อผู้ต้องหาทั้งหมดของคดี
+    suspects_json: JSON array ของ object ผู้ต้องหา
+    """
+    try:
+        rows = json.loads(suspects_json)
+        if not isinstance(rows, list):
+            raise HTTPException(400, "suspects_json ต้องเป็น JSON array")
+        if len(rows) > 5:
+            raise HTTPException(400, "รองรับผู้ต้องหาสูงสุด 5 คนต่อคดี")
+
+        insert_rows = []
+        for i, s in enumerate(rows):
+            insert_rows.append({
+                "case_type":   case_type,
+                "case_ref_id": case_ref_id,
+                "seq":         i + 1,
+                "title":       s.get("title", ""),
+                "first_name":  s.get("first_name", ""),
+                "last_name":   s.get("last_name", ""),
+                "id_card":     s.get("id_card", ""),
+                "age":         s.get("age") or None,
+                "address":     s.get("address", ""),
+                "phone":       s.get("phone", ""),
+                "charge":      s.get("charge", ""),
+                "note":        s.get("note", ""),
+                "photo_url":   s.get("photo_url", ""),
+            })
+
+        if insert_rows:
+            db.table("suspects").insert(insert_rows).execute()
+
+        return {"success": True, "count": len(insert_rows)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/get-suspects/{case_type}/{case_ref_id}", tags=["Suspects"])
+async def get_suspects(
+    case_type:   str,
+    case_ref_id: int,
+    db: Client = Depends(get_db),
+):
+    get_table(case_type)
+    try:
+        res = db.table("suspects") \
+            .select("*") \
+            .eq("case_type", case_type) \
+            .eq("case_ref_id", case_ref_id) \
+            .order("seq") \
+            .execute()
+        return {"success": True, "data": res.data or []}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/upload-suspect-photo/", tags=["Suspects"])
+async def upload_suspect_photo(
+    photo: UploadFile = File(...),
+    case_ref_id: int  = Form(...),
+    seq: int          = Form(1),
+    db: Client = Depends(get_db),
+):
+    """อัปโหลดรูปผู้ต้องหา — คืน URL"""
+    ext = os.path.splitext(photo.filename)[1].lower()
+    if ext not in IMAGE_CONTENT_TYPES:
+        raise HTTPException(400, "รองรับเฉพาะ .jpg .jpeg .png .webp .gif")
+
+    content = await photo.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(413, "รูปภาพใหญ่เกิน 5 MB")
+
+    storage_path = f"suspects/{case_ref_id}_{seq}{ext}"
+    ct = IMAGE_CONTENT_TYPES[ext]
+
+    try:
+        url = upload_bytes_to_storage(db, "dnp-photos", storage_path, content, ct)
+        return {"success": True, "photo_url": url}
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.delete("/delete-suspects/{case_type}/{case_ref_id}", tags=["Suspects"])
+async def delete_suspects(
+    case_type:   str,
+    case_ref_id: int,
+    db: Client = Depends(get_db),
+):
+    get_table(case_type)
+    try:
+        db.table("suspects") \
+            .delete() \
+            .eq("case_type", case_type) \
+            .eq("case_ref_id", case_ref_id) \
+            .execute()
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ─────────────────────────────────────────────────
+# 15. EXHIBITS ENDPOINTS
+# ─────────────────────────────────────────────────
+
+@app.post("/save-exhibits/", tags=["Exhibits"])
+async def save_exhibits(
+    case_type:     str = Form(...),
+    case_ref_id:   int = Form(...),
+    exhibits_json: str = Form(...),
+    db: Client = Depends(get_db),
+):
+    """
+    บันทึกรายการของกลางทั้งหมดของคดี
+    exhibits_json: JSON array ของ object ของกลาง
+    """
+    try:
+        rows = json.loads(exhibits_json)
+        if not isinstance(rows, list):
+            raise HTTPException(400, "exhibits_json ต้องเป็น JSON array")
+        if len(rows) > 10:
+            raise HTTPException(400, "รองรับของกลางสูงสุด 10 รายการต่อคดี")
+
+        insert_rows = []
+        for i, ex in enumerate(rows):
+            insert_rows.append({
+                "case_type":    case_type,
+                "case_ref_id":  case_ref_id,
+                "seq":          i + 1,
+                "exhibit_type": ex.get("exhibit_type", ""),
+                "description":  ex.get("description", ""),
+                "quantity":     ex.get("quantity") or 0,
+                "unit":         ex.get("unit", ""),
+                "size_vol":     ex.get("size_vol", ""),
+                "value_thb":    ex.get("value_thb") or 0,
+                "storage_loc":  ex.get("storage_loc", ""),
+                "note":         ex.get("note", ""),
+            })
+
+        if insert_rows:
+            db.table("exhibits").insert(insert_rows).execute()
+
+        return {"success": True, "count": len(insert_rows)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/get-exhibits/{case_type}/{case_ref_id}", tags=["Exhibits"])
+async def get_exhibits(
+    case_type:   str,
+    case_ref_id: int,
+    db: Client = Depends(get_db),
+):
+    get_table(case_type)
+    try:
+        res = db.table("exhibits") \
+            .select("*") \
+            .eq("case_type", case_type) \
+            .eq("case_ref_id", case_ref_id) \
+            .order("seq") \
+            .execute()
+        return {"success": True, "data": res.data or []}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/delete-exhibits/{case_type}/{case_ref_id}", tags=["Exhibits"])
+async def delete_exhibits(
+    case_type:   str,
+    case_ref_id: int,
+    db: Client = Depends(get_db),
+):
+    get_table(case_type)
+    try:
+        db.table("exhibits") \
+            .delete() \
+            .eq("case_type", case_type) \
+            .eq("case_ref_id", case_ref_id) \
+            .execute()
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ─────────────────────────────────────────────────
+# 16. CASE LIST / DELETE ENDPOINTS
+# ─────────────────────────────────────────────────
+
 @app.get("/get-cases/{case_type}", tags=["Cases"])
 async def get_cases(
     case_type: str,
@@ -950,7 +1134,7 @@ async def get_cases(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# ── ลบคดี ─────────────────────────────────────────────────────────────────
+
 @app.delete("/delete-case/{case_type}/{case_no}", tags=["Cases"])
 async def delete_case(
     case_type: str,
@@ -959,12 +1143,26 @@ async def delete_case(
 ):
     table = get_table(case_type)
     try:
+        # ดึง id ก่อนลบ เพื่อลบ suspects/exhibits ที่เชื่อมกัน
+        res = db.table(table).select("id").eq("case_no", case_no).execute()
+        if res.data:
+            case_id = res.data[0]["id"]
+            db.table("suspects").delete() \
+                .eq("case_type", case_type) \
+                .eq("case_ref_id", case_id).execute()
+            db.table("exhibits").delete() \
+                .eq("case_type", case_type) \
+                .eq("case_ref_id", case_id).execute()
+
         db.table(table).delete().eq("case_no", case_no).execute()
         return {"success": True, "message": f"ลบคดี {case_no} เรียบร้อย"}
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# ── UTM Converter ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# 17. UTILS
+# ─────────────────────────────────────────────────
+
 @app.get("/convert-utm", tags=["Utils"])
 def convert_utm_api(
     zone:     int   = Query(47),
@@ -978,7 +1176,7 @@ def convert_utm_api(
     except Exception as e:
         raise HTTPException(400, f"แปลงพิกัดไม่ได้: {e}")
 
-# ── Reload schema cache ────────────────────────────────────────────────────
+
 @app.post("/reload-schema/", tags=["Admin"])
 async def reload_schema(db: Client = Depends(get_db)):
     clear_schema_cache()
@@ -988,7 +1186,7 @@ async def reload_schema(db: Client = Depends(get_db)):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-# ── Debug endpoint ─────────────────────────────────────────────────────────
+
 @app.post("/debug-shp/", tags=["Debug"])
 async def debug_shp(
     shp_file: UploadFile = File(...),
@@ -1045,8 +1243,9 @@ async def debug_shp(
     return result
 
 # ─────────────────────────────────────────────────
-# 12. GLOBAL ERROR HANDLER
+# 18. GLOBAL ERROR HANDLER
 # ─────────────────────────────────────────────────
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     log.exception(f"Unhandled error: {exc}")
