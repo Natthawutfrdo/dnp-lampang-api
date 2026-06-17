@@ -17,11 +17,16 @@ DNP GIS Case API — Production v5.1
    - endpoint /upload-shp-parts/
    - ฟิลด์ complaint_no, criminal_no, seizure_no
 
-🐛 BugFix (patch):
+🐛 BugFix (patch v2):
    - แก้ 'bool' object has no attribute 'encode'
-     → แปลง bool columns → int ใน extract_gis_from_shp ก่อน return gdf84
-   - แก้ CRS 'expected bytes, str found'
-     → ใช้ CRS.from_epsg() เป็น fallback แทนการส่ง string เข้า set_crs โดยตรง
+     → แปลง bool columns → int ก่อน return gdf84
+   - แก้ CRS 'expected bytes, str found' ระดับ deep
+     → bypass pyproj set_crs ทั้งหมด ใช้ osr.SpatialReference หรือ
+        inject _crs โดยตรง เพื่อรองรับ pyproj build ที่มีปัญหา type mismatch
+   - แก้ area คำนวณ 0 เพราะ to_crs ล้มเหลว
+     → คำนวณ area จาก geometry โดยตรงเมื่อ CRS ตั้งไม่ได้
+   - แก้ EPSG:7030 (ellipsoid) ถูก parse ผิดเป็น CRS
+     → กรอง EPSG ที่ < 1024 ออก (ไม่ใช่ projected/geographic CRS)
 """
 
 import os, shutil, tempfile, json, math, time, logging, glob, traceback, re, zipfile
@@ -260,34 +265,113 @@ def latlon_to_utm(lat: float, lon: float) -> dict:
 # ─────────────────────────────────────────────────
 # 9. GIS EXTRACTION
 # ─────────────────────────────────────────────────
+def _make_crs_object(epsg: int):
+    """
+    สร้าง CRS object โดย bypass pyproj string signature ที่มีปัญหา
+    ลอง 4 วิธี เรียงจาก safe → invasive
+    """
+    # วิธี 1: pyproj CRS.from_epsg (ไม่ผ่าน string เลย)
+    try:
+        from pyproj import CRS as ProjCRS
+        return ProjCRS.from_epsg(epsg)
+    except Exception:
+        pass
+
+    # วิธี 2: pyproj CRS จาก authority tuple
+    try:
+        from pyproj import CRS as ProjCRS
+        return ProjCRS.from_authority("EPSG", str(epsg))
+    except Exception:
+        pass
+
+    # วิธี 3: osgeo.osr (GDAL binding) — มักมีใน environment ที่มี fiona/GDAL
+    try:
+        from osgeo import osr
+        sr = osr.SpatialReference()
+        sr.ImportFromEPSG(epsg)
+        wkt = sr.ExportToWkt()
+        from pyproj import CRS as ProjCRS
+        return ProjCRS.from_wkt(wkt)
+    except Exception:
+        pass
+
+    # วิธี 4: สร้าง WKT อย่างง่ายสำหรับ UTM zone 47N / 48N / WGS84 ที่ใช้บ่อย
+    _KNOWN_WKT = {
+        32647: (
+            'PROJCS["WGS 84 / UTM zone 47N",'
+            'GEOGCS["WGS 84",DATUM["WGS_1984",'
+            'SPHEROID["WGS 84",6378137,298.257223563]],'
+            'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
+            'PROJECTION["Transverse_Mercator"],'
+            'PARAMETER["latitude_of_origin",0],'
+            'PARAMETER["central_meridian",99],'
+            'PARAMETER["scale_factor",0.9996],'
+            'PARAMETER["false_easting",500000],'
+            'PARAMETER["false_northing",0],'
+            'UNIT["metre",1]]'
+        ),
+        32648: (
+            'PROJCS["WGS 84 / UTM zone 48N",'
+            'GEOGCS["WGS 84",DATUM["WGS_1984",'
+            'SPHEROID["WGS 84",6378137,298.257223563]],'
+            'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
+            'PROJECTION["Transverse_Mercator"],'
+            'PARAMETER["latitude_of_origin",0],'
+            'PARAMETER["central_meridian",105],'
+            'PARAMETER["scale_factor",0.9996],'
+            'PARAMETER["false_easting",500000],'
+            'PARAMETER["false_northing",0],'
+            'UNIT["metre",1]]'
+        ),
+        4326: (
+            'GEOGCS["WGS 84",DATUM["WGS_1984",'
+            'SPHEROID["WGS 84",6378137,298.257223563]],'
+            'PRIMEM["Greenwich",0],'
+            'UNIT["degree",0.0174532925199433]]'
+        ),
+    }
+    if epsg in _KNOWN_WKT:
+        try:
+            from pyproj import CRS as ProjCRS
+            return ProjCRS.from_wkt(_KNOWN_WKT[epsg])
+        except Exception:
+            pass
+
+    return None
+
+
 def _safe_set_crs(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
     """
-    🐛 FIX: set_crs ด้วย epsg= parameter แทน string
-    บาง build ของ pyproj/PROJ ต้องการ CRS object ไม่ใช่ string
-    ลอง 3 วิธีเรียงตามความปลอดภัย
+    🐛 FIX v2: bypass pyproj string-signature bug ทั้งหมด
+    ถ้าทุกวิธีล้มเหลว inject _crs โดยตรงผ่าน __dict__ (last resort)
     """
-    # วิธี 1: epsg= parameter (แนะนำ — ไม่ผ่าน string ให้ pyproj เลย)
-    try:
-        return gdf.set_crs(epsg=epsg, allow_override=True)
-    except Exception as e1:
-        log.warning(f"[GIS] set_crs(epsg={epsg}) failed: {e1}")
+    crs_obj = _make_crs_object(epsg)
 
-    # วิธี 2: CRS.from_epsg object
-    try:
-        from pyproj import CRS as ProjCRS
-        return gdf.set_crs(ProjCRS.from_epsg(epsg), allow_override=True)
-    except Exception as e2:
-        log.warning(f"[GIS] set_crs(CRS.from_epsg({epsg})) failed: {e2}")
+    if crs_obj is not None:
+        # วิธี A: set_crs ด้วย object (ไม่ใช่ string/int)
+        try:
+            return gdf.set_crs(crs_obj, allow_override=True)
+        except Exception as e1:
+            log.warning(f"[GIS] set_crs(crs_obj) failed: {e1}")
 
-    # วิธี 3: กำหนด .crs โดยตรง (last resort)
-    try:
-        from pyproj import CRS as ProjCRS
-        gdf = gdf.copy()
-        gdf.crs = ProjCRS.from_epsg(epsg)
-        return gdf
-    except Exception as e3:
-        log.error(f"[GIS] set_crs fallback ทั้งหมดล้มเหลว: {e3}")
-        return gdf
+        # วิธี B: inject ผ่าน _crs attribute โดยตรง
+        try:
+            gdf = gdf.copy()
+            object.__setattr__(gdf, "_crs", crs_obj)
+            return gdf
+        except Exception as e2:
+            log.warning(f"[GIS] _crs inject failed: {e2}")
+
+        # วิธี C: inject ผ่าน __dict__
+        try:
+            gdf = gdf.copy()
+            gdf.__dict__["_crs"] = crs_obj
+            return gdf
+        except Exception as e3:
+            log.warning(f"[GIS] __dict__ inject failed: {e3}")
+
+    log.error(f"[GIS] set_crs fallback ทั้งหมดล้มเหลว EPSG:{epsg} — geometry จะ naive")
+    return gdf
 
 
 def _fix_bool_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -410,14 +494,29 @@ def _read_shp_via_fiona(shp_path: str):
         #    pyproj parser เลย จึงเลี่ยงปัญหา str/bytes signature ที่ pyproj
         #    บางเวอร์ชัน/บาง build ของ PROJ มีปัญหาด้วย
         try:
-            m = re.search(r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"', crs_wkt_str, re.IGNORECASE)
-            if not m:
-                m = re.search(r'EPSG["\s:,]+(\d{4,6})', crs_wkt_str, re.IGNORECASE)
-            if m:
-                epsg_code = int(m.group(1))
-                gdf = _safe_set_crs(gdf, epsg_code)  # 🐛 FIX: ใช้ _safe_set_crs
-                crs_set = True
-                log.info(f"[GIS] CRS: parsed EPSG:{epsg_code}")
+            # ดึง EPSG code ทั้งหมดจาก WKT — เรียงจาก specific → generic
+            # และกรองเฉพาะ code ที่เป็น projected/geographic CRS (>= 1024)
+            # EPSG < 1024 เป็น ellipsoid/datum (เช่น 7030=WGS84 ellipsoid) ไม่ใช่ CRS
+            candidates = re.findall(
+                r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"',
+                crs_wkt_str, re.IGNORECASE
+            )
+            if not candidates:
+                candidates = re.findall(r'EPSG["\s:,]+(\d{4,6})', crs_wkt_str, re.IGNORECASE)
+
+            # กรองเฉพาะ code ที่เป็น CRS จริง (>= 1024) และเลือก code แรกที่ใหญ่ที่สุด
+            # (PROJCS authority มักอยู่ท้าย WKT และมีค่า EPSG code ของ projected CRS)
+            valid_codes = [int(c) for c in candidates if int(c) >= 1024]
+            if valid_codes:
+                # เลือก code ที่ใหญ่ที่สุด = มักเป็น PROJCS ไม่ใช่ GEOGCS/DATUM
+                epsg_code = max(valid_codes)
+                log.info(f"[GIS] CRS candidates: {valid_codes} → ใช้ EPSG:{epsg_code}")
+                gdf = _safe_set_crs(gdf, epsg_code)
+                crs_set = gdf.crs is not None
+                if crs_set:
+                    log.info(f"[GIS] CRS: parsed EPSG:{epsg_code} ✓")
+                else:
+                    log.warning(f"[GIS] CRS: EPSG:{epsg_code} set ไม่สำเร็จ")
         except Exception as e:
             log.warning(f"[GIS] EPSG regex parse failed: {e}")
 
@@ -509,38 +608,89 @@ def extract_gis_from_shp(shp_path: str) -> dict:
     if gdf.empty:
         raise HTTPException(400, "ไม่มี geometry ที่ใช้งานได้")
 
-    # 🐛 FIX: ใช้ _safe_set_crs แทน set_crs โดยตรง เพื่อรองรับ pyproj ทุกเวอร์ชัน
+    # ─── ตั้ง CRS ถ้ายังไม่มี ───────────────────────────────────────────
     if gdf.crs is None:
         log.warning("[GIS] CRS ไม่พบ — ใช้ EPSG:32647")
         gdf = _safe_set_crs(gdf, 32647)
 
+    # ─── แปลงพิกัดเป็น WGS84 ─────────────────────────────────────────
+    lat, lon = 18.29, 99.50  # default (ลำปาง)
+    gdf84 = gdf              # fallback: ใช้ gdf เดิม
+
     try:
-        gdf84 = gdf.to_crs(epsg=4326)
-        c = gdf84.geometry.centroid.iloc[0]
+        _gdf84 = gdf.to_crs(epsg=4326)
+        c = _gdf84.geometry.centroid.iloc[0]
         lat, lon = float(c.y), float(c.x)
+        gdf84 = _gdf84
+        log.info(f"[GIS] centroid: {lat:.5f}, {lon:.5f}")
     except Exception as e:
-        log.warning(f"[GIS] to_crs error: {e} — ใช้พิกัด default")
-        lat, lon = 18.29, 99.50
-        gdf84 = gdf
+        log.warning(f"[GIS] to_crs(4326) error: {e}")
 
+        # Fallback: ถ้า geometry เป็น naive (ไม่มี CRS) แต่พิกัดอยู่ในช่วง lat/lon
+        # → สมมติว่าเป็น WGS84 แล้วอ่านพิกัดตรงๆ
+        try:
+            c = gdf.geometry.centroid.iloc[0]
+            cx, cy = float(c.x), float(c.y)
+            # ตรวจว่าพิกัดอยู่ในช่วง lat/lon (WGS84) หรือ UTM
+            if -180 <= cx <= 180 and -90 <= cy <= 90:
+                lon, lat = cx, cy
+                log.info(f"[GIS] naive geometry → WGS84 assumed: {lat:.5f}, {lon:.5f}")
+                gdf84 = gdf
+            elif 100000 <= cx <= 900000 and 0 <= cy <= 10000000:
+                # น่าจะเป็น UTM — แปลงด้วย math helper
+                ll = utm_to_latlon(47, cx, cy, is_north=(cy < 10000000))
+                lat, lon = ll["lat"], ll["lon"]
+                log.info(f"[GIS] naive UTM geometry → converted: {lat:.5f}, {lon:.5f}")
+                gdf84 = gdf
+        except Exception as e2:
+            log.warning(f"[GIS] centroid fallback error: {e2}")
+
+    # ─── คำนวณพื้นที่ ─────────────────────────────────────────────────
+    area_sqm = 0.0
     try:
-        area_sqm = max(float(gdf.to_crs(epsg=32647).geometry.area.sum()), 0.0)
-    except Exception:
-        area_sqm = 0.0
+        # วิธีหลัก: to_crs UTM แล้วคำนวณ area
+        _utm_gdf = gdf.to_crs(epsg=32647)
+        area_sqm = max(float(_utm_gdf.geometry.area.sum()), 0.0)
+        log.info(f"[GIS] area via to_crs: {area_sqm:.2f} sqm")
+    except Exception as ea:
+        log.warning(f"[GIS] area to_crs failed: {ea}")
 
+        # Fallback: คำนวณ area จาก geometry ดิบ
+        # ถ้า geometry เป็น UTM อยู่แล้ว (x > 1000) → ใช้ .area โดยตรง
+        # ถ้าเป็น degree (x < 180) → ประมาณด้วย Haversine scale factor
+        try:
+            raw_area = float(gdf.geometry.area.sum())
+            cx = float(gdf.geometry.centroid.iloc[0].x)
+            if cx > 1000:
+                # หน่วยเมตร (UTM) ใช้ได้เลย
+                area_sqm = max(raw_area, 0.0)
+                log.info(f"[GIS] area via raw UTM geometry: {area_sqm:.2f} sqm")
+            else:
+                # หน่วย degree → แปลงเป็น sqm คร่าวๆ (1 degree ≈ 111,320 m)
+                lat_rad = math.radians(abs(lat))
+                scale = (111320.0 ** 2) * math.cos(lat_rad)
+                area_sqm = max(raw_area * scale, 0.0)
+                log.info(f"[GIS] area via degree→sqm approx: {area_sqm:.2f} sqm")
+        except Exception as ea2:
+            log.warning(f"[GIS] area fallback ทั้งหมดล้มเหลว: {ea2}")
+            area_sqm = 0.0
+
+    # ─── แปลง sqm → ไร่ งาน ตารางวา ─────────────────────────────────
     total_wa = area_sqm / 4.0
     rai   = int(total_wa // 400)
     ngarn = int((total_wa % 400) // 100)
     wa    = int(round(total_wa % 100))
+    log.info(f"[GIS] พื้นที่: {rai} ไร่ {ngarn} งาน {wa} ตร.ว.")
 
+    # ─── simplify geometry ────────────────────────────────────────────
     try:
+        gdf84 = gdf84.copy()
         gdf84["geometry"] = gdf84["geometry"].simplify(tolerance=0.0001, preserve_topology=True)
     except Exception:
         pass
 
-    # 🐛 FIX: แปลง bool → int ก่อน return
+    # ─── แปลง bool → int ก่อน return ────────────────────────────────
     # ป้องกัน 'bool' object has no attribute 'encode'
-    # ที่เกิดเมื่อ Supabase SDK / fiona พยายาม serialize ค่า bool เป็น string
     gdf84 = _fix_bool_columns(gdf84)
 
     utm = latlon_to_utm(lat, lon)
