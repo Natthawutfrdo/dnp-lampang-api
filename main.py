@@ -614,14 +614,16 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         gdf = _safe_set_crs(gdf, 32647)
 
     # ─── แปลงพิกัดเป็น WGS84 ─────────────────────────────────────────
-    lat, lon = 18.29, 99.50  # default (ลำปาง)
+    lat, lon = 18.29, 99.50  # default (ลำปาง) — ใช้เฉพาะตอนคำนวณจริงไม่ได้
     gdf84 = gdf              # fallback: ใช้ gdf เดิม
+    geometry_ok = False      # 🆕 True เมื่อคำนวณ centroid จาก geometry จริงสำเร็จเท่านั้น
 
     try:
         _gdf84 = gdf.to_crs(epsg=4326)
         c = _gdf84.geometry.centroid.iloc[0]
         lat, lon = float(c.y), float(c.x)
         gdf84 = _gdf84
+        geometry_ok = True
         log.info(f"[GIS] centroid: {lat:.5f}, {lon:.5f}")
     except Exception as e:
         log.warning(f"[GIS] to_crs(4326) error: {e}")
@@ -634,16 +636,24 @@ def extract_gis_from_shp(shp_path: str) -> dict:
             # ตรวจว่าพิกัดอยู่ในช่วง lat/lon (WGS84) หรือ UTM
             if -180 <= cx <= 180 and -90 <= cy <= 90:
                 lon, lat = cx, cy
+                geometry_ok = True
                 log.info(f"[GIS] naive geometry → WGS84 assumed: {lat:.5f}, {lon:.5f}")
                 gdf84 = gdf
             elif 100000 <= cx <= 900000 and 0 <= cy <= 10000000:
                 # น่าจะเป็น UTM — แปลงด้วย math helper
                 ll = utm_to_latlon(47, cx, cy, is_north=(cy < 10000000))
                 lat, lon = ll["lat"], ll["lon"]
+                geometry_ok = True
                 log.info(f"[GIS] naive UTM geometry → converted: {lat:.5f}, {lon:.5f}")
                 gdf84 = gdf
         except Exception as e2:
             log.warning(f"[GIS] centroid fallback error: {e2}")
+
+    if not geometry_ok:
+        log.warning(
+            "[GIS] ⚠️ ไม่สามารถคำนวณตำแหน่งจริงจาก geometry ได้ "
+            "— ใช้พิกัดกลางลำปางเป็นค่า placeholder (geometry_ok=False)"
+        )
 
     # ─── คำนวณพื้นที่ ─────────────────────────────────────────────────
     area_sqm = 0.0
@@ -698,6 +708,7 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         "gdf84": gdf84,
         "lat": lat, "lon": lon,
         "rai": rai, "ngarn": ngarn, "wa": wa,
+        "geometry_ok": geometry_ok,
         **utm,
     }
 
@@ -810,6 +821,7 @@ async def analyze_shapefile(
         "utm_zone":     gis["utm_zone"],
         "utm_easting":  gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
+        "geometry_ok":  gis.get("geometry_ok", False),
     }
 
 @app.post("/upload-shp-parts/", tags=["GIS"])
@@ -869,6 +881,7 @@ async def upload_shp_parts(
         "utm_zone":     gis["utm_zone"],
         "utm_easting":  gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
+        "geometry_ok":  gis.get("geometry_ok", False),
         "urls":         urls,
         "geojson_url":  geojson_url,
         "shp_url":      urls.get("shp", ""),
@@ -924,6 +937,19 @@ async def process_shapefile(
                 tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
             )
             gis = extract_gis_from_shp(shp_path)
+
+            # 🆕 กันคดี "ผี" — ถ้าคำนวณตำแหน่งจริงจาก Shapefile ไม่ได้เลย
+            # ห้ามสร้างคดีต่อ (ไม่ปล่อยให้เงียบๆ ใช้พิกัดกลางลำปางแทน)
+            if not gis.get("geometry_ok", False):
+                return JSONResponse({
+                    "success": False,
+                    "error": (
+                        "ไม่สามารถคำนวณตำแหน่งจริงจากไฟล์ Shapefile ได้ "
+                        "(geometry ว่างเปล่า/ผิดรูป หรือแปลงพิกัดไม่สำเร็จ) "
+                        "กรุณาตรวจสอบไฟล์ .shp/.dbf/.shx/.prj แล้วลองใหม่ "
+                        "ระบบจะไม่บันทึกคดีที่ไม่มีพิกัดจริงเพื่อป้องกันข้อมูลผิดพลาด"
+                    ),
+                })
 
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
@@ -1098,8 +1124,21 @@ async def process_wildlife(
         except Exception as e:
             log.warning(f"Wildlife PDF upload failed: {e}")
 
+    # 🆕 ต้องมีพิกัดจริงอย่างน้อยทางใดทางหนึ่ง (lat/lon หรือ UTM)
+    # ห้ามเงียบๆ ใช้พิกัดกลางลำปางแทน เพราะจะดูเหมือนมี marker แต่ไม่ใช่ตำแหน่งจริง
+    has_latlon = bool(coords_lat) or bool(coords_lon)
+    has_utm    = bool(utm_easting) or bool(utm_northing)
+    if not has_latlon and not has_utm:
+        return JSONResponse({
+            "success": False,
+            "error": (
+                "กรุณาระบุพิกัด (Lat/Lon หรือ UTM E/N) อย่างน้อยทางใดทางหนึ่ง "
+                "ระบบจะไม่บันทึกคดีที่ไม่มีพิกัดจริงเพื่อป้องกันข้อมูลผิดพลาด"
+            ),
+        })
+
     is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
-    coords      = [coords_lat, coords_lon] if (coords_lat or coords_lon) else [18.29, 99.50]
+    coords      = [coords_lat, coords_lon] if (coords_lat or coords_lon) else None
 
     f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
     if utm_easting == 0 and coords_lat:
@@ -1109,8 +1148,19 @@ async def process_wildlife(
         try:
             ll = utm_to_latlon(utm_zone, utm_easting, utm_northing)
             coords = [ll["lat"], ll["lon"]]
-        except Exception:
-            coords = [18.29, 99.50]
+        except Exception as e:
+            log.warning(f"[wildlife] utm_to_latlon error: {e}")
+            return JSONResponse({
+                "success": False,
+                "error": "ค่าพิกัด UTM ไม่ถูกต้อง ไม่สามารถแปลงเป็น Lat/Lon ได้",
+            })
+
+    if coords is None:
+        # กรณีนี้ไม่ควรเกิดขึ้นแล้วเพราะเช็คไว้ข้างบน แต่กันไว้อีกชั้น
+        return JSONResponse({
+            "success": False,
+            "error": "ไม่สามารถระบุพิกัดของคดีได้ กรุณาตรวจสอบข้อมูลที่กรอก",
+        })
 
     try:
         row: dict = {
