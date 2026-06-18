@@ -1,25 +1,11 @@
-
-from pyproj import CRS
-
-def force_set_crs(gdf, epsg_code="EPSG:32647"):
-    try:
-        if gdf.crs is None:
-            gdf = force_set_crs(gdf, "EPSG:32647")
-        return gdf
-    except Exception as e:
-        log.warning(f"[GIS] set_crs direct failed: {e}")
-
-    try:
-        crs_obj = CRS.from_epsg(int(epsg_code.split(":")[1]))
-        gdf.crs = crs_obj
-        return gdf
-    except Exception as e:
-        log.error(f"[GIS] set_crs fallback ทั้งหมดล้มเหลว {epsg_code}: {e}")
-        return gdf
-
 """
-DNP GIS Case API — Production v5.1
+DNP GIS Case API — Production v5.1 (patch v3)
 ระบบ API สารบบคดีเชิงพื้นที่ สบอ.13 ลำปาง
+
+🆕 patch v3:
+   - เพิ่ม geometry_ok flag ใน extract_gis_from_shp
+   - process_shapefile: ปฏิเสธคดีที่คำนวณตำแหน่งไม่ได้จริง (ป้องกัน "ผี")
+   - process_wildlife: บังคับให้มีพิกัดจริงอย่างน้อยทางใดทางหนึ่ง
 
 🆕 v5.1:
    - เพิ่มตาราง suspects (ผู้ต้องหา) รองรับสูงสุด 5 คนต่อคดี
@@ -103,6 +89,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 MAX_FILE_MB  = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_BYTES    = MAX_FILE_MB * 1024 * 1024
+
+# พิกัดกลางลำปาง — ใช้เป็น fallback สุดท้าย เพื่อตรวจจับว่าตำแหน่งเป็น "ผี"
+_DEFAULT_LAT = 18.29
+_DEFAULT_LON = 99.50
+_DEFAULT_TOLERANCE = 0.001   # ถ้าพิกัดห่างจาก default น้อยกว่านี้ ถือว่า fallback
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -289,32 +280,28 @@ def _make_crs_object(epsg: int):
     สร้าง CRS object โดย bypass pyproj string signature ที่มีปัญหา
     ลอง 4 วิธี เรียงจาก safe → invasive
     """
-    # วิธี 1: pyproj CRS.from_epsg (ไม่ผ่าน string เลย)
     try:
         from pyproj import CRS as ProjCRS
         return ProjCRS.from_epsg(epsg)
     except Exception:
         pass
 
-    # วิธี 2: pyproj CRS จาก authority tuple
     try:
         from pyproj import CRS as ProjCRS
         return ProjCRS.from_authority("EPSG", str(epsg))
     except Exception:
         pass
 
-    # วิธี 3: osgeo.osr (GDAL binding) — มักมีใน environment ที่มี fiona/GDAL
     try:
         from osgeo import osr
         sr = osr.SpatialReference()
         sr.ImportFromEPSG(epsg)
         wkt = sr.ExportToWkt()
         from pyproj import CRS as ProjCRS
-        return ProjCRS.from_epsg(32647)
+        return ProjCRS.from_wkt(wkt)
     except Exception:
         pass
 
-    # วิธี 4: สร้าง WKT อย่างง่ายสำหรับ UTM zone 47N / 48N / WGS84 ที่ใช้บ่อย
     _KNOWN_WKT = {
         32647: (
             'PROJCS["WGS 84 / UTM zone 47N",'
@@ -352,7 +339,7 @@ def _make_crs_object(epsg: int):
     if epsg in _KNOWN_WKT:
         try:
             from pyproj import CRS as ProjCRS
-            return ProjCRS.from_epsg(32647)
+            return ProjCRS.from_wkt(_KNOWN_WKT[epsg])
         except Exception:
             pass
 
@@ -362,18 +349,15 @@ def _make_crs_object(epsg: int):
 def _safe_set_crs(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
     """
     🐛 FIX v2: bypass pyproj string-signature bug ทั้งหมด
-    ถ้าทุกวิธีล้มเหลว inject _crs โดยตรงผ่าน __dict__ (last resort)
     """
     crs_obj = _make_crs_object(epsg)
 
     if crs_obj is not None:
-        # วิธี A: set_crs ด้วย object (ไม่ใช่ string/int)
         try:
             return gdf.set_crs(crs_obj, allow_override=True)
         except Exception as e1:
             log.warning(f"[GIS] set_crs(crs_obj) failed: {e1}")
 
-        # วิธี B: inject ผ่าน _crs attribute โดยตรง
         try:
             gdf = gdf.copy()
             object.__setattr__(gdf, "_crs", crs_obj)
@@ -381,7 +365,6 @@ def _safe_set_crs(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
         except Exception as e2:
             log.warning(f"[GIS] _crs inject failed: {e2}")
 
-        # วิธี C: inject ผ่าน __dict__
         try:
             gdf = gdf.copy()
             gdf.__dict__["_crs"] = crs_obj
@@ -396,8 +379,6 @@ def _safe_set_crs(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
 def _fix_bool_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     🐛 FIX: แปลง bool dtype → int
-    Supabase storage SDK และ fiona/shapefile writer ไม่รองรับ bool
-    ทำให้เกิด 'bool' object has no attribute 'encode'
     """
     try:
         bool_cols = gdf.select_dtypes(include="bool").columns.tolist()
@@ -492,15 +473,13 @@ def _read_shp_via_fiona(shp_path: str):
                     return _tmp
             except Exception as eg:
                 log.warning(f"[GIS][fiona→gpd] enc={enc} failed: {eg}")
-        raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry) หรือไฟล์ชำรุด")
+        raise HTTPException(400, "ไฟล์ Shapefile ไม่มีข้อมูลรูปแปลง (Geometry ว่างเปล่า)")
 
     rows = [r for r in rows if r.get("geometry") is not None]
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
 
     crs_set = False
     if crs_wkt:
-        # บาง build ของ fiona/GDAL คืน crs_wkt เป็น bytes แทน str — แปลงให้เป็น str
-        # ก่อนเสมอ ไม่งั้น regex และ pyproj parsing จะพังแบบงงๆ (type mismatch)
         if isinstance(crs_wkt, bytes):
             try:
                 crs_wkt_str = crs_wkt.decode("utf-8", errors="ignore")
@@ -509,13 +488,7 @@ def _read_shp_via_fiona(shp_path: str):
         else:
             crs_wkt_str = str(crs_wkt)
 
-        # 1) ลองดึง EPSG code จากข้อความ WKT ตรงๆ ก่อน — เร็วกว่าและไม่ผ่าน
-        #    pyproj parser เลย จึงเลี่ยงปัญหา str/bytes signature ที่ pyproj
-        #    บางเวอร์ชัน/บาง build ของ PROJ มีปัญหาด้วย
         try:
-            # ดึง EPSG code ทั้งหมดจาก WKT — เรียงจาก specific → generic
-            # และกรองเฉพาะ code ที่เป็น projected/geographic CRS (>= 1024)
-            # EPSG < 1024 เป็น ellipsoid/datum (เช่น 7030=WGS84 ellipsoid) ไม่ใช่ CRS
             candidates = re.findall(
                 r'AUTHORITY\s*\[\s*"EPSG"\s*,\s*"(\d{4,6})"',
                 crs_wkt_str, re.IGNORECASE
@@ -523,11 +496,8 @@ def _read_shp_via_fiona(shp_path: str):
             if not candidates:
                 candidates = re.findall(r'EPSG["\s:,]+(\d{4,6})', crs_wkt_str, re.IGNORECASE)
 
-            # กรองเฉพาะ code ที่เป็น CRS จริง (>= 1024) และเลือก code แรกที่ใหญ่ที่สุด
-            # (PROJCS authority มักอยู่ท้าย WKT และมีค่า EPSG code ของ projected CRS)
             valid_codes = [int(c) for c in candidates if int(c) >= 1024]
             if valid_codes:
-                # เลือก code ที่ใหญ่ที่สุด = มักเป็น PROJCS ไม่ใช่ GEOGCS/DATUM
                 epsg_code = max(valid_codes)
                 log.info(f"[GIS] CRS candidates: {valid_codes} → ใช้ EPSG:{epsg_code}")
                 gdf = _safe_set_crs(gdf, epsg_code)
@@ -539,18 +509,15 @@ def _read_shp_via_fiona(shp_path: str):
         except Exception as e:
             log.warning(f"[GIS] EPSG regex parse failed: {e}")
 
-        # 2) ถ้า regex หา EPSG ไม่เจอ ค่อย fallback ไปลอง parse WKT เต็มรูปแบบ
-        #    ด้วย pyproj (เฉพาะ str เท่านั้น — ไม่ลอง bytes เพราะ pyproj ต้องการ
-        #    str และการ encode เป็น bytes คือสาเหตุของ error ที่เคยเจอ)
         if not crs_set:
             for method, fn in [
-                ("from_wkt(str)", lambda: ProjCRS.from_epsg(32647)),
-                ("from_user_input", lambda: ProjCRS.from_epsg(32647)),
+                ("from_wkt(str)", lambda: ProjCRS.from_wkt(crs_wkt_str)),
+                ("from_user_input", lambda: ProjCRS.from_user_input(crs_wkt_str)),
             ]:
                 if crs_set:
                     break
                 try:
-                    gdf = force_set_crs(gdf, "EPSG:32647"), allow_override=True)
+                    gdf = gdf.set_crs(fn(), allow_override=True)
                     crs_set = True
                     log.info(f"[GIS] CRS: {method} ok")
                 except Exception as e:
@@ -558,12 +525,17 @@ def _read_shp_via_fiona(shp_path: str):
 
     if not crs_set:
         log.warning("[GIS] CRS ไม่สามารถตั้งได้ — ใช้ EPSG:32647")
-        gdf = _safe_set_crs(gdf, 32647)  # 🐛 FIX: ใช้ _safe_set_crs แทน set_crs โดยตรง
+        gdf = _safe_set_crs(gdf, 32647)
 
     return gdf
 
 
 def extract_gis_from_shp(shp_path: str) -> dict:
+    """
+    🆕 patch v3: เพิ่ม geometry_ok flag
+    - geometry_ok = True  → คำนวณพิกัดจาก geometry จริง
+    - geometry_ok = False → ใช้ fallback พิกัดกลางลำปาง (ควรปฏิเสธคดี)
+    """
     from shapely.validation import make_valid
     import geopandas as gpd
 
@@ -633,59 +605,63 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         gdf = _safe_set_crs(gdf, 32647)
 
     # ─── แปลงพิกัดเป็น WGS84 ─────────────────────────────────────────
-    lat, lon = 18.29, 99.50  # default (ลำปาง)
-    gdf84 = gdf              # fallback: ใช้ gdf เดิม
+    lat, lon = _DEFAULT_LAT, _DEFAULT_LON
+    gdf84 = gdf
+    geometry_ok = False   # 🆕 patch v3: ติดตามว่าได้พิกัดจริงไหม
 
     try:
         _gdf84 = gdf.to_crs(epsg=4326)
         c = _gdf84.geometry.centroid.iloc[0]
-        lat, lon = float(c.y), float(c.x)
-        gdf84 = _gdf84
-        log.info(f"[GIS] centroid: {lat:.5f}, {lon:.5f}")
+        _lat, _lon = float(c.y), float(c.x)
+
+        # ตรวจว่าพิกัดที่ได้อยู่ในช่วงสมเหตุสมผล (ประเทศไทย ± กันดาร)
+        if 5.0 <= _lat <= 21.0 and 97.0 <= _lon <= 106.0:
+            lat, lon = _lat, _lon
+            gdf84 = _gdf84
+            geometry_ok = True
+            log.info(f"[GIS] centroid ok: {lat:.5f}, {lon:.5f}")
+        else:
+            log.warning(f"[GIS] centroid out of TH bbox: {_lat:.5f}, {_lon:.5f}")
     except Exception as e:
         log.warning(f"[GIS] to_crs(4326) error: {e}")
 
-        # Fallback: ถ้า geometry เป็น naive (ไม่มี CRS) แต่พิกัดอยู่ในช่วง lat/lon
-        # → สมมติว่าเป็น WGS84 แล้วอ่านพิกัดตรงๆ
         try:
             c = gdf.geometry.centroid.iloc[0]
             cx, cy = float(c.x), float(c.y)
-            # ตรวจว่าพิกัดอยู่ในช่วง lat/lon (WGS84) หรือ UTM
             if -180 <= cx <= 180 and -90 <= cy <= 90:
                 lon, lat = cx, cy
-                log.info(f"[GIS] naive geometry → WGS84 assumed: {lat:.5f}, {lon:.5f}")
                 gdf84 = gdf
+                if 5.0 <= lat <= 21.0 and 97.0 <= lon <= 106.0:
+                    geometry_ok = True
+                log.info(f"[GIS] naive geometry → WGS84 assumed: {lat:.5f}, {lon:.5f}")
             elif 100000 <= cx <= 900000 and 0 <= cy <= 10000000:
-                # น่าจะเป็น UTM — แปลงด้วย math helper
                 ll = utm_to_latlon(47, cx, cy, is_north=(cy < 10000000))
                 lat, lon = ll["lat"], ll["lon"]
-                log.info(f"[GIS] naive UTM geometry → converted: {lat:.5f}, {lon:.5f}")
                 gdf84 = gdf
+                if 5.0 <= lat <= 21.0 and 97.0 <= lon <= 106.0:
+                    geometry_ok = True
+                log.info(f"[GIS] naive UTM geometry → converted: {lat:.5f}, {lon:.5f}")
         except Exception as e2:
             log.warning(f"[GIS] centroid fallback error: {e2}")
+
+    if not geometry_ok:
+        log.warning(f"[GIS] geometry_ok=False — พิกัดไม่สามารถคำนวณได้จาก Shapefile จริง")
 
     # ─── คำนวณพื้นที่ ─────────────────────────────────────────────────
     area_sqm = 0.0
     try:
-        # วิธีหลัก: to_crs UTM แล้วคำนวณ area
         _utm_gdf = gdf.to_crs(epsg=32647)
         area_sqm = max(float(_utm_gdf.geometry.area.sum()), 0.0)
         log.info(f"[GIS] area via to_crs: {area_sqm:.2f} sqm")
     except Exception as ea:
         log.warning(f"[GIS] area to_crs failed: {ea}")
-
-        # Fallback: คำนวณ area จาก geometry ดิบ
-        # ถ้า geometry เป็น UTM อยู่แล้ว (x > 1000) → ใช้ .area โดยตรง
-        # ถ้าเป็น degree (x < 180) → ประมาณด้วย Haversine scale factor
         try:
             raw_area = float(gdf.geometry.area.sum())
             cx = float(gdf.geometry.centroid.iloc[0].x)
             if cx > 1000:
-                # หน่วยเมตร (UTM) ใช้ได้เลย
                 area_sqm = max(raw_area, 0.0)
                 log.info(f"[GIS] area via raw UTM geometry: {area_sqm:.2f} sqm")
             else:
-                # หน่วย degree → แปลงเป็น sqm คร่าวๆ (1 degree ≈ 111,320 m)
                 lat_rad = math.radians(abs(lat))
                 scale = (111320.0 ** 2) * math.cos(lat_rad)
                 area_sqm = max(raw_area * scale, 0.0)
@@ -709,14 +685,17 @@ def extract_gis_from_shp(shp_path: str) -> dict:
         pass
 
     # ─── แปลง bool → int ก่อน return ────────────────────────────────
-    # ป้องกัน 'bool' object has no attribute 'encode'
     gdf84 = _fix_bool_columns(gdf84)
 
     utm = latlon_to_utm(lat, lon)
     return {
-        "gdf84": gdf84,
-        "lat": lat, "lon": lon,
-        "rai": rai, "ngarn": ngarn, "wa": wa,
+        "gdf84":       gdf84,
+        "lat":         lat,
+        "lon":         lon,
+        "rai":         rai,
+        "ngarn":       ngarn,
+        "wa":          wa,
+        "geometry_ok": geometry_ok,   # 🆕 patch v3
         **utm,
     }
 
@@ -789,7 +768,7 @@ def root():
         "status": "ok",
         "version": "5.1.0",
         "upload_mode": "separate_files (.shp .dbf .shx .prj)",
-        "features": ["suspects", "exhibits", "photo_upload"],
+        "features": ["suspects", "exhibits", "photo_upload", "geometry_validation"],
     }
 
 @app.get("/health", tags=["Health"])
@@ -829,6 +808,7 @@ async def analyze_shapefile(
         "utm_zone":     gis["utm_zone"],
         "utm_easting":  gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
+        "geometry_ok":  gis["geometry_ok"],
     }
 
 @app.post("/upload-shp-parts/", tags=["GIS"])
@@ -888,6 +868,7 @@ async def upload_shp_parts(
         "utm_zone":     gis["utm_zone"],
         "utm_easting":  gis["utm_easting"],
         "utm_northing": gis["utm_northing"],
+        "geometry_ok":  gis["geometry_ok"],
         "urls":         urls,
         "geojson_url":  geojson_url,
         "shp_url":      urls.get("shp", ""),
@@ -943,6 +924,18 @@ async def process_shapefile(
                 tmp, shp_file, dbf_file, shx_file, prj_file, cpg_file
             )
             gis = extract_gis_from_shp(shp_path)
+
+            # 🆕 patch v3: ปฏิเสธถ้าคำนวณพิกัดจาก Shapefile ไม่ได้จริง
+            if not gis["geometry_ok"]:
+                return JSONResponse({
+                    "success": False,
+                    "error": (
+                        "ไม่สามารถคำนวณพิกัดจากไฟล์ Shapefile ได้ "
+                        "กรุณาตรวจสอบว่าไฟล์มีข้อมูล Geometry และ Projection (.prj) ถูกต้อง "
+                        f"(centroid ที่คำนวณได้อยู่นอกขอบเขตประเทศไทย)"
+                    ),
+                    "geometry_ok": False,
+                })
 
             f_zone     = utm_zone     if utm_easting != 0 else gis["utm_zone"]
             f_easting  = utm_easting  if utm_easting != 0 else gis["utm_easting"]
@@ -1019,7 +1012,7 @@ async def process_shapefile(
                         "suspects_count": suspects_count,
                         "shapefile_url": shp_url,
                         "pdf_url":       pdf_url,
-                        "geojson_data":  geojson_obj,
+                        "geojson_data":  geojson_url,
                         "utm_zone":      f_zone,
                         "utm_easting":   f_easting,
                         "utm_northing":  f_northing,
@@ -1049,7 +1042,7 @@ async def process_shapefile(
                         "suspects_count": suspects_count,
                         "shapefile_url": shp_url,
                         "pdf_url":       pdf_url,
-                        "geojson_data":  geojson_obj,
+                        "geojson_data":  geojson_url,
                         "utm_zone":      f_zone,
                         "utm_easting":   f_easting,
                         "utm_northing":  f_northing,
@@ -1073,6 +1066,7 @@ async def process_shapefile(
                 "utm_zone":      f_zone,
                 "utm_easting":   f_easting,
                 "utm_northing":  f_northing,
+                "geometry_ok":   gis["geometry_ok"],
             }
 
     except HTTPException:
@@ -1104,6 +1098,22 @@ async def process_wildlife(
     utm_northing:   int   = Form(0),
     db: Client = Depends(get_db),
 ):
+    # 🆕 patch v3: บังคับให้มีพิกัดอย่างน้อยทางใดทางหนึ่ง
+    has_latlon = (coords_lat != 0.0 and coords_lon != 0.0
+                  and 5.0 <= coords_lat <= 21.0
+                  and 97.0 <= coords_lon <= 106.0)
+    has_utm    = (utm_easting > 100000 and utm_northing > 100000)
+
+    if not has_latlon and not has_utm:
+        return JSONResponse({
+            "success": False,
+            "error": (
+                "กรุณาระบุพิกัดที่เกิดเหตุ — ต้องกรอก UTM แล้วกด 'แปลง UTM' "
+                "หรือกรอก Latitude / Longitude โดยตรง "
+                "(พิกัดต้องอยู่ในขอบเขตประเทศไทย)"
+            ),
+        })
+
     pdf_url = ""
     if pdf_file and pdf_file.filename:
         await validate_file(pdf_file, "pdf", max_bytes=20 * 1024 * 1024)
@@ -1118,18 +1128,25 @@ async def process_wildlife(
             log.warning(f"Wildlife PDF upload failed: {e}")
 
     is_finished = status in ("คดีสิ้นสุด", "finished", "done", "true", "1")
-    coords      = [coords_lat, coords_lon] if (coords_lat or coords_lon) else [18.29, 99.50]
 
-    f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
-    if utm_easting == 0 and coords_lat:
-        u = latlon_to_utm(coords[0], coords[1])
-        f_zone, f_east, f_north = u["utm_zone"], u["utm_easting"], u["utm_northing"]
-    if coords_lat == 0.0 and utm_easting:
+    # เลือกพิกัดที่ดีที่สุด
+    if has_latlon:
+        coords = [coords_lat, coords_lon]
+        f_zone  = utm_zone
+        f_east  = utm_easting
+        f_north = utm_northing
+        # ถ้าไม่มี UTM → คำนวณจาก lat/lon
+        if not has_utm:
+            u = latlon_to_utm(coords_lat, coords_lon)
+            f_zone, f_east, f_north = u["utm_zone"], u["utm_easting"], u["utm_northing"]
+    else:
+        # มีแต่ UTM → แปลงเป็น lat/lon
+        f_zone, f_east, f_north = utm_zone, utm_easting, utm_northing
         try:
             ll = utm_to_latlon(utm_zone, utm_easting, utm_northing)
             coords = [ll["lat"], ll["lon"]]
         except Exception:
-            coords = [18.29, 99.50]
+            coords = [_DEFAULT_LAT, _DEFAULT_LON]
 
     try:
         row: dict = {
@@ -1179,10 +1196,6 @@ async def save_suspects(
     suspects_json: str = Form(...),
     db: Client = Depends(get_db),
 ):
-    """
-    บันทึกรายชื่อผู้ต้องหาทั้งหมดของคดี
-    suspects_json: JSON array ของ object ผู้ต้องหา
-    """
     try:
         rows = json.loads(suspects_json)
         if not isinstance(rows, list):
@@ -1244,7 +1257,6 @@ async def upload_suspect_photo(
     seq: int          = Form(1),
     db: Client = Depends(get_db),
 ):
-    """อัปโหลดรูปผู้ต้องหา — คืน URL"""
     ext = os.path.splitext(photo.filename)[1].lower()
     if ext not in IMAGE_CONTENT_TYPES:
         raise HTTPException(400, "รองรับเฉพาะ .jpg .jpeg .png .webp .gif")
@@ -1291,10 +1303,6 @@ async def save_exhibits(
     exhibits_json: str = Form(...),
     db: Client = Depends(get_db),
 ):
-    """
-    บันทึกรายการของกลางทั้งหมดของคดี
-    exhibits_json: JSON array ของ object ของกลาง
-    """
     try:
         rows = json.loads(exhibits_json)
         if not isinstance(rows, list):
@@ -1404,7 +1412,6 @@ async def delete_case(
 ):
     table = get_table(case_type)
     try:
-        # ดึง id ก่อนลบ เพื่อลบ suspects/exhibits ที่เชื่อมกัน
         res = db.table(table).select("id").eq("case_no", case_no).execute()
         if res.data:
             case_id = res.data[0]["id"]
@@ -1490,6 +1497,7 @@ async def debug_shp(
                     "utm_zone":     pipeline["utm_zone"],
                     "utm_easting":  pipeline["utm_easting"],
                     "utm_northing": pipeline["utm_northing"],
+                    "geometry_ok":  pipeline["geometry_ok"],
                     "gdf_len":      len(pipeline["gdf84"]),
                 }
             except Exception as ep:
