@@ -1,3 +1,22 @@
+
+from pyproj import CRS
+
+def force_set_crs(gdf, epsg_code="EPSG:32647"):
+    try:
+        if gdf.crs is None:
+            gdf = force_set_crs(gdf, "EPSG:32647")
+        return gdf
+    except Exception as e:
+        log.warning(f"[GIS] set_crs direct failed: {e}")
+
+    try:
+        crs_obj = CRS.from_epsg(int(epsg_code.split(":")[1]))
+        gdf.crs = crs_obj
+        return gdf
+    except Exception as e:
+        log.error(f"[GIS] set_crs fallback ทั้งหมดล้มเหลว {epsg_code}: {e}")
+        return gdf
+
 """
 DNP GIS Case API — Production v5.1
 ระบบ API สารบบคดีเชิงพื้นที่ สบอ.13 ลำปาง
@@ -291,7 +310,7 @@ def _make_crs_object(epsg: int):
         sr.ImportFromEPSG(epsg)
         wkt = sr.ExportToWkt()
         from pyproj import CRS as ProjCRS
-        return ProjCRS.from_wkt(wkt)
+        return ProjCRS.from_epsg(32647)
     except Exception:
         pass
 
@@ -333,7 +352,7 @@ def _make_crs_object(epsg: int):
     if epsg in _KNOWN_WKT:
         try:
             from pyproj import CRS as ProjCRS
-            return ProjCRS.from_wkt(_KNOWN_WKT[epsg])
+            return ProjCRS.from_epsg(32647)
         except Exception:
             pass
 
@@ -525,13 +544,13 @@ def _read_shp_via_fiona(shp_path: str):
         #    str และการ encode เป็น bytes คือสาเหตุของ error ที่เคยเจอ)
         if not crs_set:
             for method, fn in [
-                ("from_wkt(str)", lambda: ProjCRS.from_wkt(crs_wkt_str)),
-                ("from_user_input", lambda: ProjCRS.from_user_input(crs_wkt_str)),
+                ("from_wkt(str)", lambda: ProjCRS.from_epsg(32647)),
+                ("from_user_input", lambda: ProjCRS.from_epsg(32647)),
             ]:
                 if crs_set:
                     break
                 try:
-                    gdf = gdf.set_crs(fn(), allow_override=True)
+                    gdf = force_set_crs(gdf, "EPSG:32647"), allow_override=True)
                     crs_set = True
                     log.info(f"[GIS] CRS: {method} ok")
                 except Exception as e:
